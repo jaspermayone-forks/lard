@@ -6,6 +6,7 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -60,6 +61,29 @@ func SubjectPath(kind SubjectKind, name string) string {
 		return "people/" + name + ".md"
 	default:
 		return name + ".md"
+	}
+}
+
+// ParseSubjectPath maps a request path ("profile", "areas/crush",
+// "profile.md") back to a (kind, name). It is the inverse of SubjectPath.
+func ParseSubjectPath(p string) (SubjectKind, string, error) {
+	p = strings.TrimSuffix(strings.Trim(p, "/"), ".md")
+	if p == "profile" || p == "" {
+		return KindProfile, "profile", nil
+	}
+	dir, name, ok := strings.Cut(p, "/")
+	if !ok {
+		return "", "", fmt.Errorf("path must be profile, areas/<name>, topics/<name>, or people/<name>")
+	}
+	switch dir {
+	case "areas":
+		return KindArea, name, nil
+	case "topics":
+		return KindTopic, name, nil
+	case "people":
+		return KindPeople, name, nil
+	default:
+		return "", "", fmt.Errorf("unknown memory folder %q", dir)
 	}
 }
 

@@ -414,6 +414,18 @@ func (s *Store) ResolveSubject(kind types.SubjectKind, name string) (string, err
 	return "", rows.Err()
 }
 
+// SubjectForProject returns the name of the area linked to a project id, or
+// "" if none is.
+func (s *Store) SubjectForProject(projectID string) (string, error) {
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM subjects WHERE kind = ? AND project_id = ? LIMIT 1`,
+		string(types.KindArea), projectID).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return name, err
+}
+
 // DeleteSubject removes a subject's file and index row.
 func (s *Store) DeleteSubject(kind types.SubjectKind, name string) error {
 	if err := os.Remove(filepath.Join(s.memDir, types.SubjectPath(kind, name))); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -536,21 +548,4 @@ func (s *Store) ListProjects() ([]*types.Project, error) {
 		out = append(out, p)
 	}
 	return out, nil
-}
-
-// --- Watermarks (per-source ingest offset) ---
-
-func (s *Store) GetWatermark(source string) (string, error) {
-	var v string
-	err := s.db.QueryRow(`SELECT value FROM watermarks WHERE source = ?`, source).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	return v, err
-}
-
-func (s *Store) SetWatermark(source, value string) error {
-	_, err := s.db.Exec(`INSERT INTO watermarks (source, value) VALUES (?,?)
-		ON CONFLICT(source) DO UPDATE SET value=excluded.value`, source, value)
-	return err
 }

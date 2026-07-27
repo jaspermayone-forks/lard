@@ -31,13 +31,19 @@ func NewUploader(baseURL, token string) *Uploader {
 	}
 }
 
-// Ingest posts an IngestRequest to /ingest.
-func (u *Uploader) Ingest(ctx context.Context, req types.IngestRequest) error {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return err
+// post sends one JSON request and decodes the JSON reply. A nil body means
+// no payload; a nil out means the reply body is ignored. Non-2xx responses
+// come back as an error carrying the server's message.
+func (u *Uploader) post(ctx context.Context, path string, body, out any) error {
+	var reader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(b)
 	}
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, u.BaseURL+"/ingest", bytes.NewReader(body))
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, u.BaseURL+path, reader)
 	if err != nil {
 		return err
 	}
@@ -52,56 +58,30 @@ func (u *Uploader) Ingest(ctx context.Context, req types.IngestRequest) error {
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("ingest %d: %s", resp.StatusCode, string(b))
+		return fmt.Errorf("%s %d: %s", path, resp.StatusCode, string(b))
 	}
-	return nil
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// Ingest posts an IngestRequest to /ingest.
+func (u *Uploader) Ingest(ctx context.Context, req types.IngestRequest) error {
+	return u.post(ctx, "/ingest", req, nil)
 }
 
 // Consolidate triggers a server-side consolidation pass.
 func (u *Uploader) Consolidate(ctx context.Context) error {
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, u.BaseURL+"/consolidate", nil)
-	if err != nil {
-		return err
-	}
-	if u.Token != "" {
-		r.Header.Set("authorization", "Bearer "+u.Token)
-	}
-	resp, err := u.HTTP.Do(r)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("consolidate %d: %s", resp.StatusCode, string(b))
-	}
-	return nil
+	return u.post(ctx, "/consolidate", nil, nil)
 }
 
 // ResolveProject asks the service to canonicalize hints and returns the id.
 func (u *Uploader) ResolveProject(ctx context.Context, hints *types.ProjectHints) (string, error) {
-	body, _ := json.Marshal(map[string]any{"hints": hints})
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, u.BaseURL+"/projects/resolve", bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	r.Header.Set("content-type", "application/json")
-	if u.Token != "" {
-		r.Header.Set("authorization", "Bearer "+u.Token)
-	}
-	resp, err := u.HTTP.Do(r)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("resolve %d: %s", resp.StatusCode, string(b))
-	}
 	var out struct {
 		ProjectID string `json:"projectId"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := u.post(ctx, "/projects/resolve", map[string]any{"hints": hints}, &out); err != nil {
 		return "", err
 	}
 	return out.ProjectID, nil

@@ -9,7 +9,6 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/taciturnaxolotl/lard/internal/llm"
@@ -100,9 +99,6 @@ func Extract(ctx context.Context, client *llm.Client, sess *types.SessionBatch, 
 	}
 	raw, err := client.Complete(ctx, extractSystem, user, 8192)
 	if err != nil {
-		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate limit") {
-			slog.Warn("extract: possible rate limit", "error", err)
-		}
 		return nil, fmt.Errorf("extract: %w", err)
 	}
 	var cands []types.Candidate

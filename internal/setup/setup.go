@@ -57,7 +57,7 @@ func Run(ctx context.Context, opts Options) (*client.Config, error) {
 	// LoadConfig defaults the URL to localhost, which is a fine fallback but a
 	// bad thing to silently adopt on a machine whose server is elsewhere. Treat
 	// an unedited default as "not yet configured" and ask.
-	if opts.URL == "" && needsURL(path, cfg) {
+	if opts.URL == "" && needsURL(path) {
 		if !Interactive() {
 			return nil, errors.New("no server configured: pass --url https://lard.example.com")
 		}
@@ -82,7 +82,7 @@ func Run(ctx context.Context, opts Options) (*client.Config, error) {
 }
 
 // needsURL reports whether the URL is still unset in any meaningful sense.
-func needsURL(path string, cfg *client.Config) bool {
+func needsURL(path string) bool {
 	if _, err := os.Stat(path); err == nil {
 		return false // an existing file is the user's choice, default or not
 	}

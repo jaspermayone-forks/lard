@@ -8,10 +8,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/auth"
@@ -132,18 +130,17 @@ func (s *Server) ContextBundle(projectID string) (*types.ContextBundle, error) {
 	}
 	bundle.Listing = listing
 	if projectID != "" {
-		// Find the area whose project_id matches; fall back to listing scan.
-		for _, l := range listing {
-			if l.Kind != types.KindArea {
-				continue
-			}
-			sub, err := s.st.GetSubject(types.KindArea, l.Name)
+		name, err := s.st.SubjectForProject(projectID)
+		if err != nil {
+			return nil, err
+		}
+		if name != "" {
+			sub, err := s.st.GetSubject(types.KindArea, name)
 			if err != nil {
 				return nil, err
 			}
-			if sub != nil && sub.ProjectID == projectID {
+			if sub != nil {
 				bundle.Area = sub.Body
-				break
 			}
 		}
 	}
@@ -161,31 +158,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, listing)
 }
 
-// parsePath maps a request path ("profile", "areas/crush", "profile.md") to
-// a (kind, name).
-func parsePath(p string) (types.SubjectKind, string, error) {
-	p = strings.TrimSuffix(strings.Trim(p, "/"), ".md")
-	if p == "profile" || p == "" {
-		return types.KindProfile, "profile", nil
-	}
-	dir, name, ok := strings.Cut(p, "/")
-	if !ok {
-		return "", "", fmt.Errorf("path must be profile, areas/<name>, topics/<name>, or people/<name>")
-	}
-	switch dir {
-	case "areas":
-		return types.KindArea, name, nil
-	case "topics":
-		return types.KindTopic, name, nil
-	case "people":
-		return types.KindPeople, name, nil
-	default:
-		return "", "", fmt.Errorf("unknown memory folder %q", dir)
-	}
-}
-
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
-	kind, name, err := parsePath(r.PathValue("path"))
+	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -209,7 +183,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
-	kind, name, err := parsePath(r.PathValue("path"))
+	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -225,33 +199,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	existing, err := s.st.GetSubject(kind, name)
+	sub, err := pipeline.ApplyPatch(s.st, s.registry, kind, name, pipeline.SubjectPatch{
+		Body:        &body.Body,
+		Description: body.Description,
+		Aliases:     body.Aliases,
+		Repos:       body.Repos,
+		Version:     body.Version,
+	})
+	if errors.Is(err, pipeline.ErrVersionConflict) {
+		writeConflict(w, sub)
+		return
+	}
 	if err != nil {
-		writeErr(w, 500, err)
-		return
-	}
-	if err := checkVersion(existing, body.Version); err != nil {
-		writeConflict(w, existing)
-		return
-	}
-	sub := existing
-	if sub == nil {
-		sub = &types.Subject{Kind: kind, Name: name}
-	}
-	sub.Body = body.Body
-	if body.Description != "" {
-		sub.Description = body.Description
-	}
-	if body.Aliases != nil {
-		sub.Aliases = body.Aliases
-	}
-	if body.Repos != nil {
-		if _, err := pipeline.AttachRepos(s.registry, sub, body.Repos); err != nil {
-			writeErr(w, 500, err)
-			return
-		}
-	}
-	if err := s.st.PutSubject(sub, 0); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
@@ -259,7 +218,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
-	kind, name, err := parsePath(r.PathValue("path"))
+	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -271,36 +230,16 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	if strings.TrimSpace(body.Line) == "" {
-		writeErr(w, 400, errors.New("line required"))
-		return
-	}
-	sub, err := s.st.GetSubject(kind, name)
+	sub, err := pipeline.AppendLine(s.st, kind, name, body.Line)
 	if err != nil {
-		writeErr(w, 500, err)
-		return
-	}
-	if sub == nil {
-		sub = &types.Subject{Kind: kind, Name: name, Description: name}
-	}
-	line := strings.TrimSpace(body.Line)
-	if !strings.HasPrefix(line, "-") {
-		line = "- " + line
-	}
-	if sub.Body == "" {
-		sub.Body = line
-	} else {
-		sub.Body = strings.TrimRight(sub.Body, "\n") + "\n" + line
-	}
-	if err := s.st.PutSubject(sub, 0); err != nil {
-		writeErr(w, 500, err)
+		writeErr(w, 400, err)
 		return
 	}
 	writeJSON(w, 200, sub)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
-	kind, name, err := parsePath(r.PathValue("path"))
+	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -310,19 +249,6 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "deleted"})
-}
-
-func checkVersion(existing *types.Subject, want string) error {
-	if want == "" || want == "new" {
-		return nil // caller opted out of the check
-	}
-	if existing == nil {
-		return nil
-	}
-	if existing.Version != want {
-		return errors.New("version mismatch")
-	}
-	return nil
 }
 
 func writeConflict(w http.ResponseWriter, current *types.Subject) {

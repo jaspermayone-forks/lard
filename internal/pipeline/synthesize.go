@@ -34,7 +34,8 @@ func Synthesize(ctx context.Context, client *llm.Client, sub *types.Subject, fac
 	if strings.TrimSpace(sub.Body) == "" {
 		b.WriteString("(empty)\n")
 	} else {
-		b.WriteString(sub.Body + "\n")
+		b.WriteString(sub.Body)
+		b.WriteString("\n")
 	}
 	b.WriteString("\nNEW FACTS (chronological):\n")
 	for _, f := range facts {

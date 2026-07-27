@@ -6,6 +6,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -72,7 +73,7 @@ func New(api *httpapi.Server) *mcp.Server {
 		Name:        "memory_read",
 		Description: `Read one subject file's body and version token. Pass the version to memory_write for safe concurrent edits.`,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args readArgs) (*mcp.CallToolResult, any, error) {
-		kind, name, err := parsePath(args.Path)
+		kind, name, err := types.ParseSubjectPath(args.Path)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -99,37 +100,21 @@ func New(api *httpapi.Server) *mcp.Server {
 		Name:        "memory_write",
 		Description: `Create or fully overwrite a subject file. Read first (for the version token) and merge, rather than clobbering. Not an append — omitted lines are deleted. Passing repos on an area also links it to the project registry.`,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args writeArgs) (*mcp.CallToolResult, any, error) {
-		kind, name, err := parsePath(args.Path)
+		kind, name, err := types.ParseSubjectPath(args.Path)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		existing, err := api.Store().GetSubject(kind, name)
-		if err != nil {
-			return errResult(err), nil, nil
-		}
-		if args.Version != "" && args.Version != "new" && existing != nil && existing.Version != args.Version {
+		sub, err := pipeline.ApplyPatch(api.Store(), api.Registry(), kind, name, pipeline.SubjectPatch{
+			Body:        &args.Body,
+			Description: args.Description,
+			Aliases:     args.Aliases,
+			Repos:       args.Repos,
+			Version:     args.Version,
+		})
+		if errors.Is(err, pipeline.ErrVersionConflict) {
 			return errResult(fmt.Errorf("version mismatch; re-read %s and merge", args.Path)), nil, nil
 		}
-		sub := existing
-		if sub == nil {
-			sub = &types.Subject{Kind: kind, Name: name}
-		}
-		sub.Body = args.Body
-		if args.Description != "" {
-			sub.Description = args.Description
-		}
-		if args.Aliases != nil {
-			sub.Aliases = args.Aliases
-		}
-		if sub.Description == "" {
-			sub.Description = name
-		}
-		if args.Repos != nil {
-			if _, err := pipeline.AttachRepos(api.Registry(), sub, args.Repos); err != nil {
-				return errResult(err), nil, nil
-			}
-		}
-		if err := api.Store().PutSubject(sub, 0); err != nil {
+		if err != nil {
 			return errResult(err), nil, nil
 		}
 		msg := fmt.Sprintf("wrote %s [version: %s]", args.Path, sub.Version)
@@ -148,27 +133,12 @@ func New(api *httpapi.Server) *mcp.Server {
 		Name:        "memory_append",
 		Description: `Append a single fact to a subject without resending its whole body. Creates the subject if absent.`,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, any, error) {
-		kind, name, err := parsePath(args.Path)
+		kind, name, err := types.ParseSubjectPath(args.Path)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		sub, err := api.Store().GetSubject(kind, name)
+		sub, err := pipeline.AppendLine(api.Store(), kind, name, args.Line)
 		if err != nil {
-			return errResult(err), nil, nil
-		}
-		if sub == nil {
-			sub = &types.Subject{Kind: kind, Name: name, Description: name}
-		}
-		line := strings.TrimSpace(args.Line)
-		if !strings.HasPrefix(line, "-") {
-			line = "- " + line
-		}
-		if sub.Body == "" {
-			sub.Body = line
-		} else {
-			sub.Body = strings.TrimRight(sub.Body, "\n") + "\n" + line
-		}
-		if err := api.Store().PutSubject(sub, 0); err != nil {
 			return errResult(err), nil, nil
 		}
 		return textResult(fmt.Sprintf("appended to %s [version: %s]", args.Path, sub.Version)), nil, nil
@@ -182,7 +152,7 @@ func New(api *httpapi.Server) *mcp.Server {
 		Name:        "memory_delete",
 		Description: `Delete a whole subject file. Only on explicit user request.`,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteArgs) (*mcp.CallToolResult, any, error) {
-		kind, name, err := parsePath(args.Path)
+		kind, name, err := types.ParseSubjectPath(args.Path)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -193,28 +163,6 @@ func New(api *httpapi.Server) *mcp.Server {
 	})
 
 	return s
-}
-
-// parsePath maps a subject path to (kind, name).
-func parsePath(p string) (types.SubjectKind, string, error) {
-	p = strings.TrimSuffix(strings.Trim(p, "/"), ".md")
-	if p == "profile" || p == "" {
-		return types.KindProfile, "profile", nil
-	}
-	dir, name, ok := strings.Cut(p, "/")
-	if !ok {
-		return "", "", fmt.Errorf("path must be profile, areas/<name>, topics/<name>, or people/<name>")
-	}
-	switch dir {
-	case "areas":
-		return types.KindArea, name, nil
-	case "topics":
-		return types.KindTopic, name, nil
-	case "people":
-		return types.KindPeople, name, nil
-	default:
-		return "", "", fmt.Errorf("unknown memory folder %q", dir)
-	}
 }
 
 func textResult(text string) *mcp.CallToolResult {

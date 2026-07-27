@@ -3,7 +3,6 @@ package collector
 import (
 	"crypto/rand"
 	"encoding/base32"
-	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -53,8 +52,6 @@ type deviceSession struct {
 
 	lastPoll time.Time
 }
-
-func (s *deviceSession) done() bool { return s.Token != nil || s.Err != "" }
 
 // deviceStore holds pending device authorizations.
 type deviceStore struct {
@@ -218,5 +215,3 @@ func NormalizeUserCode(s string) string {
 	}
 	return s
 }
-
-var errNoSession = errors.New("no such authorization request")
