@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/types"
+	"github.com/taciturnaxolotl/lard/internal/xdg"
 )
 
 // Uploader pushes session batches to the central lard service.
@@ -148,10 +149,8 @@ func (s *State) Save() error {
 	return os.Rename(tmp, s.path)
 }
 
-// DefaultStatePath is ~/.config/lard/client-state.json.
+// DefaultStatePath is ~/.local/share/lard/client-state.json. State, not
+// config: it is a sync watermark the user never edits by hand.
 func DefaultStatePath() string {
-	if d, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(d, "lard", "client-state.json")
-	}
-	return "client-state.json"
+	return xdg.DataPath("client-state.json")
 }

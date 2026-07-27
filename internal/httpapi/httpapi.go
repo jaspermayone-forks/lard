@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/taciturnaxolotl/lard/internal/auth"
 	"github.com/taciturnaxolotl/lard/internal/llm"
 	"github.com/taciturnaxolotl/lard/internal/pipeline"
 	"github.com/taciturnaxolotl/lard/internal/store"
@@ -26,6 +27,7 @@ type Server struct {
 	registry *pipeline.Registry
 	llm      *llm.Client
 	mux      *http.ServeMux
+	auto     *autoConsolidator
 }
 
 // New builds the HTTP server. llmClient may be nil if consolidation is never
@@ -34,6 +36,28 @@ func New(st *store.Store, llmClient *llm.Client) *Server {
 	s := &Server{st: st, registry: pipeline.NewRegistry(st), llm: llmClient, mux: http.NewServeMux()}
 	s.routes()
 	return s
+}
+
+// EnableAutoConsolidate makes the server consolidate on its own once uploads
+// go quiet, so memory stays current without anyone calling /consolidate. No-op
+// without an LLM client, since a pass would fail anyway.
+func (s *Server) EnableAutoConsolidate(after, maxWait time.Duration) {
+	if s.llm == nil {
+		slog.Warn("auto-consolidate disabled: no LLM client")
+		return
+	}
+	s.auto = newAutoConsolidator(after, maxWait, func(ctx context.Context) error {
+		_, err := s.Consolidator().Run(ctx, 0)
+		return err
+	})
+	slog.Info("auto-consolidate enabled", "quiet_period", after, "max_wait", maxWait)
+}
+
+// StopAutoConsolidate cancels any pending scheduled pass.
+func (s *Server) StopAutoConsolidate() {
+	if s.auto != nil {
+		s.auto.Stop()
+	}
 }
 
 func (s *Server) Handler() http.Handler        { return s.mux }
@@ -45,6 +69,11 @@ func (s *Server) Consolidator() *pipeline.Consolidator {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
+
+	// Authenticated echo, so a client can prove its credentials work before
+	// installing itself as a background service. /healthz bypasses auth and
+	// therefore cannot answer that question.
+	s.mux.HandleFunc("GET /whoami", s.handleWhoami)
 
 	// Context bundle (session start).
 	s.mux.HandleFunc("GET /context", s.handleContext)
@@ -307,6 +336,18 @@ func writeConflict(w http.ResponseWriter, current *types.Subject) {
 
 // --- ingest & consolidate ---
 
+// handleWhoami reports the authenticated caller. Reaching this handler at all
+// means the credentials are good; the body says which identity they mapped to.
+func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"authenticated": true}
+	if id, ok := auth.IdentityFrom(r.Context()); ok {
+		out["subject"] = id.Subject
+		out["clientId"] = id.ClientID
+		out["scopes"] = id.Scopes
+	}
+	writeJSON(w, 200, out)
+}
+
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 	var req types.IngestRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&req); err != nil {
@@ -324,6 +365,10 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 				slog.Warn("ingest: resolve project", "session", sess.SessionID, "error", err)
 			}
 		}
+	}
+	// New work landed: start (or extend) the quiet period before consolidating.
+	if n > 0 && s.auto != nil {
+		s.auto.Trigger()
 	}
 	writeJSON(w, 200, map[string]int{"ingested": n})
 }

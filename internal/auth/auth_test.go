@@ -287,3 +287,68 @@ func TestHealthzBypassesAuth(t *testing.T) {
 		t.Fatalf("want 200, got %d", w.Code)
 	}
 }
+
+// The client id a server publishes to collectors must be accepted without the
+// operator also repeating it in the allowlist. Publishing an identity and then
+// rejecting it is the failure this guards.
+func TestCollectorClientIDIsTrustedImplicitly(t *testing.T) {
+	srv := fakeIndiko(t, map[string]any{
+		"active": true, "me": "https://indiko.example.com/u/kieran",
+		"client_id": "ikc_collector", "scope": "profile",
+	})
+	cfg := bearerConfig(srv.URL)
+	cfg.CollectorClientID = "ikc_collector"
+	h := Middleware(cfg, okHandler())
+	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
+		t.Fatalf("want 200 for the published collector id, got %d", w.Code)
+	}
+}
+
+// An explicit collector id is itself a restriction, so it must not widen access
+// to every client the user has ever authorized.
+func TestCollectorClientIDNarrowsWhenNoOtherAllowlist(t *testing.T) {
+	srv := fakeIndiko(t, map[string]any{
+		"active": true, "me": "https://indiko.example.com/u/kieran",
+		"client_id": "https://some-other-app.example.com/", "scope": "profile",
+	})
+	cfg := bearerConfig(srv.URL)
+	cfg.CollectorClientID = "ikc_collector"
+	h := Middleware(cfg, okHandler())
+	if w := do(h, "Bearer good"); w.Code != http.StatusForbidden {
+		t.Fatalf("want 403 for a foreign client, got %d", w.Code)
+	}
+}
+
+func TestCollectorClientIDAddsToExistingAllowlist(t *testing.T) {
+	srv := fakeIndiko(t, map[string]any{
+		"active": true, "me": "https://indiko.example.com/u/kieran",
+		"client_id": "ikc_mcp", "scope": "profile",
+	})
+	cfg := bearerConfig(srv.URL)
+	cfg.AllowedClientIDs = []string{"ikc_mcp"}
+	cfg.CollectorClientID = "ikc_collector"
+	h := Middleware(cfg, okHandler())
+	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+}
+
+// Setting only a collector id counts as an audience restriction, so the
+// "anyone can read your memory" warning must not fire.
+func TestValidateAcceptsCollectorIDAsAudience(t *testing.T) {
+	cfg := Config{Mode: ModeBearer, IndikoURL: "https://i", PublicURL: "https://l", CollectorClientID: "ikc_x"}
+	if warns := cfg.Validate(); len(warns) != 0 {
+		t.Fatalf("want no warnings, got %v", warns)
+	}
+}
+
+// The collector registration must be reachable without credentials, since it
+// is how a collector learns which client to be.
+func TestCollectorPathBypassesAuth(t *testing.T) {
+	h := Middleware(Config{Mode: ModeToken, Token: "s3cret"}, okHandler())
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, PathCollector, nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+}

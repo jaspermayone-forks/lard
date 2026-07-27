@@ -44,6 +44,9 @@ const (
 const (
 	PathProtectedResource = "/.well-known/oauth-protected-resource"
 	PathAuthServer        = "/.well-known/oauth-authorization-server"
+	// PathCollector is the unauthenticated prefix serving the collector OAuth
+	// registration and, for confidential clients, the code exchange.
+	PathCollector = "/auth/collector"
 )
 
 // Config holds auth settings.
@@ -66,6 +69,25 @@ type Config struct {
 	AllowedUsers []string
 	// RequiredScopes are scopes every token must carry. Empty means none.
 	RequiredScopes []string
+	// CollectorClientID is the OAuth client this server tells collectors to
+	// use. It is trusted implicitly: publishing an identity and then rejecting
+	// it would be a contradiction, and forcing the operator to repeat it in
+	// AllowedClientIDs is a step that only ever gets forgotten.
+	CollectorClientID string
+}
+
+// clientAllowlist is the set of client ids accepted, including the collector
+// registration this server hands out.
+func (c Config) clientAllowlist() []string {
+	if c.CollectorClientID == "" {
+		return c.AllowedClientIDs
+	}
+	if len(c.AllowedClientIDs) == 0 {
+		// An explicit collector id is itself a restriction, so honor it as the
+		// whole allowlist rather than treating "no list" as "allow anything".
+		return []string{c.CollectorClientID}
+	}
+	return append(append([]string{}, c.AllowedClientIDs...), c.CollectorClientID)
 }
 
 // Validate reports configuration problems worth logging at boot. Bearer mode
@@ -81,7 +103,7 @@ func (c Config) Validate() []string {
 	if c.PublicURL == "" {
 		warns = append(warns, "bearer auth has no LARD_PUBLIC_URL; OAuth discovery metadata will be incomplete")
 	}
-	if len(c.AllowedClientIDs) == 0 && len(c.AllowedUsers) == 0 {
+	if len(c.clientAllowlist()) == 0 && len(c.AllowedUsers) == 0 {
 		warns = append(warns, "bearer auth has no audience restriction: any app the user authorized with indiko can read all memory (set LARD_OAUTH_CLIENT_IDS or LARD_OAUTH_USERS)")
 	}
 	return warns
@@ -110,7 +132,9 @@ func Middleware(cfg Config, next http.Handler) http.Handler {
 	v := &verifier{cfg: cfg, cache: map[string]cacheEntry{}}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if p == "/healthz" || strings.HasPrefix(p, "/.well-known/") {
+		// Discovery and the collector registration must be reachable without
+		// credentials: they are how a caller learns to get credentials.
+		if p == "/healthz" || strings.HasPrefix(p, "/.well-known/") || strings.HasPrefix(p, PathCollector) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -229,9 +253,9 @@ func (v *verifier) authorize(r *http.Request) (id Identity, status int, code, de
 	// Denials are logged with the claims that failed. A 403 here is almost
 	// always an allowlist typo, and the operator cannot see the token's real
 	// client_id or "me" value any other way.
-	if !allowed(v.cfg.AllowedClientIDs, res.ClientID) {
+	if !allowed(v.cfg.clientAllowlist(), res.ClientID) {
 		slog.Warn("auth: client not allowed",
-			"token_client_id", res.ClientID, "allowed", v.cfg.AllowedClientIDs)
+			"token_client_id", res.ClientID, "allowed", v.cfg.clientAllowlist())
 		return id, http.StatusForbidden, "invalid_token", "token was not issued for this resource"
 	}
 	if !allowed(v.cfg.AllowedUsers, res.subject()) {

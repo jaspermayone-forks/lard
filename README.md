@@ -11,15 +11,47 @@ The canonical repo for this is hosted on tangled over at [`dunkirk.sh/lard`](htt
 echo 'HYPER_API_KEY=sk-hyper-...' > .env
 go run ./cmd/lard                    # listens on :7477
 
-# client: backfill crush sessions
-LARD_URL=http://localhost:7477 go run ./cmd/lard-client backfill --root ~/code
+# client: point it at the server, then load everything you have
+lard-client login                    # asks for the url, opens your browser
+lard-client backfill --root ~/code
 
-# update it
-LARD_URL=http://localhost:7477 go run ./cmd/lard-client daemon --interval 5m
-
-# run a consolidation pass
-LARD_URL=http://localhost:7477 go run ./cmd/lard-client consolidate
+# keep it fed in the background (macOS)
+lard-client service install
 ```
+
+`login` asks where the server lives, then runs a browser flow against whatever
+auth server lard names, so there is no token to copy. It always prints the raw
+authorization URL, so you can paste it into a browser on another machine. On a
+headless box pass `--url` and `--token` and it never prompts.
+
+when the server brokers the login (the default once `LARD_COLLECTOR_CLIENT_ID`
+is set) the collector opens no ports at all. you get a url on the server and it
+polls until you finish, so ssh, containers, and headless boxes all work the same
+way with nothing to forward.
+
+after that nothing needs poking: the agent syncs on an interval, and the server
+consolidates itself once uploads go quiet.
+
+## client
+
+```
+lard-client login    [--url URL] [--token TOKEN] [--root DIR...]
+lard-client status                        # server, auth, agent at a glance
+lard-client backfill [--root DIR...]      # every session ever, idempotent
+lard-client sync     [--workspace DIR...] # new sessions only
+lard-client daemon   [--interval 5m]      # sync in a loop, for non-macOS init
+lard-client service  install|uninstall|status
+lard-client consolidate                   # force a pass now
+```
+
+config lives at `~/.config/lard/client.json` (mode 0600, holds the token).
+`LARD_URL` and `LARD_TOKEN` override it.
+
+`service install` writes a launchd agent that syncs on an interval and survives
+reboots. It refuses to install if it cannot reach the server, since a silent
+background failure is the worst outcome. Logs go to
+`~/Library/Logs/lard-client.log`. Linux is not wired up yet: run
+`lard-client daemon` under systemd.
 
 ## Interfaces
 
@@ -67,10 +99,19 @@ paths are `profile`, `areas/<name>`, `topics/<name>`, `people/<name>`.
 | `LARD_OAUTH_CLIENT_IDS` | | comma list of client ids allowed to call lard |
 | `LARD_OAUTH_USERS` | | comma list of indiko `me` urls allowed to call lard |
 | `LARD_OAUTH_SCOPES` | | comma list of scopes every token must carry |
+| `LARD_COLLECTOR_CLIENT_ID` | | oauth client id collectors should use |
+| `LARD_COLLECTOR_CLIENT_SECRET` | | its secret; enables server-side code exchange |
+| `LARD_COLLECTOR_PORTS` | `40714-40718` | permitted localhost callback ports |
+| `LARD_CONSOLIDATE_AFTER` | `5m` | quiet period before a pass; `off` to disable |
+| `LARD_CONSOLIDATE_MAX_WAIT` | `30m` | cap on that wait during constant uploads |
 | `HYPER_API_KEY` | | hyper API key for consolidation |
 | `LARD_MODEL` | `deepseek-v4-flash` | consolidation model |
 
-client env: `LARD_URL`, `LARD_TOKEN`.
+client env: `LARD_URL`, `LARD_TOKEN` (both override `~/.config/lard/client.json`).
+
+consolidation is automatic: an ingest starts a quiet timer, and the pass runs
+once uploads stop. bursts collapse into one pass, and a machine uploading
+continuously still gets consolidated at `LARD_CONSOLIDATE_MAX_WAIT`.
 
 ## auth
 
@@ -91,6 +132,55 @@ an mcp client to find indiko and start the pkce flow on its own.
 set `LARD_OAUTH_CLIENT_IDS` or `LARD_OAUTH_USERS`. indiko mints tokens for every
 app you sign into, so without an allowlist any one of them can read all your
 memory. lard warns at boot if you skip it.
+
+### collector registration
+
+a collector cannot invent its own client id: the auth server decides which
+clients exist, and lard decides which it trusts, so a guessed id gets rejected.
+set `LARD_COLLECTOR_CLIENT_ID` and lard publishes it at `/auth/collector`, and
+`lard-client login` adopts it. that id is then trusted automatically, so it does
+not also need to be in `LARD_OAUTH_CLIENT_IDS`.
+
+if you also set `LARD_COLLECTOR_CLIENT_SECRET`, lard performs the code exchange
+itself. the collector keeps its pkce verifier, the server keeps the secret, and
+neither can complete the exchange alone. that is what lets a pre-registered
+confidential client work from a laptop CLI without shipping the secret around.
+
+### brokered login (device flow)
+
+with a collector client id and `LARD_PUBLIC_URL` set, lard brokers the whole
+authorization, following the shape of the oauth device grant ([rfc 8628]):
+
+```
+POST /auth/collector/device        client starts, gets a code + url
+GET  /auth/collector/device/verify user opens this, gets sent to the provider
+GET  ...device/callback            provider redirects here; lard exchanges
+POST ...device/token               client polls until the token appears
+```
+
+the redirect lands on lard, not on the collector, which is the whole point: a
+server url is reachable from whatever browser the user actually has. the
+collector needs no listener, no port forward, and no browser of its own.
+
+**register the callback with your provider.** lard logs the exact url at boot:
+
+```
+INFO register this redirect URI with your auth provider
+     redirect_uri=https://lard.your.domain/auth/collector/device/callback
+```
+
+that url is built from `LARD_PUBLIC_URL`, so set it to the server's external
+address before registering.
+
+pending sessions live in memory for 10 minutes, device codes are single use, and
+polling faster than once a second gets `slow_down`.
+
+[rfc 8628]: https://datatracker.ietf.org/doc/html/rfc8628
+
+with no collector registration configured, `lard-client` falls back to a
+`http://localhost:<port>/` client id and tells you to allowlist it.
+
+### indiko notes
 
 indiko has no dynamic client registration, so mcp clients that insist on
 `POST /register` will not connect. use a client that accepts a configured
