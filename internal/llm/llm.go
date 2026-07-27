@@ -36,13 +36,11 @@ type Client struct {
 // NewFromEnv builds a client from the environment:
 //
 //	LARD_HYPER_API_KEY (or HYPER_API_KEY) — required; a static hyper API key.
-//	    A .env file in the working directory is honored.
 //	LARD_MODEL          — default deepseek-v4-flash
 //	LARD_HYPER_BASE_URL — default https://hyper.charm.land
 //
 // Hyper's OpenAI-compatible endpoint drives the model, same as crush.
 func NewFromEnv(ctx context.Context) (*Client, error) {
-	loadDotEnv()
 	key := os.Getenv("LARD_HYPER_API_KEY")
 	if key == "" {
 		key = os.Getenv("HYPER_API_KEY")

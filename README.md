@@ -63,12 +63,58 @@ paths are `profile`, `areas/<name>`, `topics/<name>`, `people/<name>`.
 | `LARD_AUTH` | `none` | `none` \| `token` \| `bearer` |
 | `LARD_TOKEN` | | shared secret for `token` mode |
 | `LARD_INDIKO_URL` | `https://indiko.dunkirk.sh` | auth server for `bearer` mode |
+| `LARD_PUBLIC_URL` | | lard's external url; goes in the oauth metadata |
+| `LARD_OAUTH_CLIENT_IDS` | | comma list of client ids allowed to call lard |
+| `LARD_OAUTH_USERS` | | comma list of indiko `me` urls allowed to call lard |
+| `LARD_OAUTH_SCOPES` | | comma list of scopes every token must carry |
 | `HYPER_API_KEY` | | hyper API key for consolidation |
 | `LARD_MODEL` | `deepseek-v4-flash` | consolidation model |
 
 client env: `LARD_URL`, `LARD_TOKEN`.
 
-for auth `bearer` validates tokens against [indiko](https://indiko.dunkirk.sh)
+## auth
+
+`token` mode is a shared secret; good enough for the collector cron.
+
+`bearer` mode makes lard an oauth 2.1 protected resource in front of
+[indiko](https://indiko.dunkirk.sh). it serves
+
+- `/.well-known/oauth-protected-resource` (rfc 9728) naming indiko as the
+  authorization server
+- `/.well-known/oauth-authorization-server` as a redirect to indiko, so older
+  mcp clients still discover it. a redirect rather than a proxy because clients
+  check that the issuer matches where they fetched the document
+
+a `401` carries `WWW-Authenticate` with `resource_metadata`, which is enough for
+an mcp client to find indiko and start the pkce flow on its own.
+
+set `LARD_OAUTH_CLIENT_IDS` or `LARD_OAUTH_USERS`. indiko mints tokens for every
+app you sign into, so without an allowlist any one of them can read all your
+memory. lard warns at boot if you skip it.
+
+indiko has no dynamic client registration, so mcp clients that insist on
+`POST /register` will not connect. use a client that accepts a configured
+client id. indiko also rejects a client id whose host differs from the redirect
+uri host unless that url publishes `redirect_uris` metadata, so the simplest
+working setup is a localhost client id matching a pinned callback port.
+
+for crush, in `crush.json`:
+
+```json
+{
+  "mcp": {
+    "lard": {
+      "type": "http",
+      "url": "http://127.0.0.1:7477/mcp",
+      "oauth_client_id": "http://localhost:40704/",
+      "oauth_callback_port": 40704
+    }
+  }
+}
+```
+
+then run lard with `LARD_AUTH=bearer`, `LARD_PUBLIC_URL` set to the same origin
+crush dials, and `LARD_OAUTH_CLIENT_IDS=http://localhost:40704/`.
 
 <p align="center">
     <img src="https://raw.githubusercontent.com/taciturnaxolotl/carriage/main/.github/images/line-break.svg" />

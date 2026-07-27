@@ -95,13 +95,13 @@ type SubjectListing struct {
 // Candidate is a fact extracted from a session's user turns, routed to a
 // subject but not yet persisted.
 type Candidate struct {
-	Text        string `json:"text"`        // the durable statement
-	SubjectKind string `json:"subjectKind"` // profile | area | topic | people
-	SubjectName string `json:"subjectName"` // slug of the target subject
-	Description string `json:"description"` // one-liner if this subject is new
+	Text        string   `json:"text"`        // the durable statement
+	SubjectKind string   `json:"subjectKind"` // profile | area | topic | people
+	SubjectName string   `json:"subjectName"` // slug of the target subject
+	Description string   `json:"description"` // one-liner if this subject is new
 	Aliases     []string `json:"aliases,omitempty"`
-	Tag         string `json:"tag"`         // stated | observed | inferred
-	Sensitivity string `json:"sensitivity,omitempty"`
+	Tag         string   `json:"tag"` // stated | observed | inferred
+	Sensitivity string   `json:"sensitivity,omitempty"`
 }
 
 // --- Edge-to-center wire contract ---

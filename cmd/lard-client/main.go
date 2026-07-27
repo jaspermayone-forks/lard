@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/client"
+	"github.com/taciturnaxolotl/lard/internal/dotenv"
 )
 
 func main() {
@@ -31,6 +32,7 @@ func main() {
 }
 
 func run(args []string) error {
+	dotenv.LoadDefault()
 	if len(args) == 0 {
 		usage()
 		return fmt.Errorf("subcommand required: backfill | daemon | sync")

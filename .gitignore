@@ -1,6 +1,8 @@
 .env
+crush.json
 *.db
 *.db-shm
 *.db-wal
 /lard
 /lard-client
+/memory

@@ -36,9 +36,9 @@ func New(st *store.Store, llmClient *llm.Client) *Server {
 	return s
 }
 
-func (s *Server) Handler() http.Handler          { return s.mux }
-func (s *Server) Registry() *pipeline.Registry    { return s.registry }
-func (s *Server) Store() *store.Store             { return s.st }
+func (s *Server) Handler() http.Handler        { return s.mux }
+func (s *Server) Registry() *pipeline.Registry { return s.registry }
+func (s *Server) Store() *store.Store          { return s.st }
 func (s *Server) Consolidator() *pipeline.Consolidator {
 	return pipeline.New(s.st, s.llm, s.registry.Resolve)
 }

@@ -13,9 +13,9 @@ import (
 )
 
 const (
-	extractConcurrency   = 3
-	synthConcurrency     = 3
-	extractBatchSize     = 100
+	extractConcurrency = 3
+	synthConcurrency   = 3
+	extractBatchSize   = 100
 )
 
 // Consolidator runs the extract -> group -> synthesize pipeline.

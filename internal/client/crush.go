@@ -69,7 +69,7 @@ func SessionSince(ctx context.Context, db *sql.DB, since int64) ([]crushSession,
 }
 
 type crushSession struct {
-	id               string
+	id                   string
 	createdAt, updatedAt int64
 }
 
