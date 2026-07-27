@@ -1,6 +1,6 @@
-// Package mcpserver exposes lard's live agent surface over MCP:
-// get_context, remember, forget. It is a thin ergonomic wrapper over the
-// same store the HTTP API serves.
+// Package mcpserver exposes lard's live agent surface over MCP: reading the
+// context bundle and the subject memory files, plus writing/appending/editing
+// them. A thin wrapper over the same store the HTTP API serves.
 package mcpserver
 
 import (
@@ -18,17 +18,18 @@ import (
 
 // New builds the MCP server backed by the HTTP API server's store.
 func New(api *httpapi.Server) *mcp.Server {
-	s := mcp.NewServer(&mcp.Implementation{Name: "lard", Version: "0.1.0"}, nil)
+	s := mcp.NewServer(&mcp.Implementation{Name: "lard", Version: "0.2.0"}, nil)
 
+	// get_context — the session-start injection bundle.
 	type getContextArgs struct {
 		Project   string `json:"project,omitempty" jsonschema:"canonical project id; omit for profile only"`
 		GitRemote string `json:"gitRemote,omitempty" jsonschema:"git origin remote; normalized server-side (strongest hint)"`
-		Path      string `json:"path,omitempty" jsonschema:"absolute workspace path; weakest hint"`
+		Path      string `json:"path,omitempty" jsonschema:"absolute workspace path"`
 		Name      string `json:"name,omitempty" jsonschema:"human project label"`
 	}
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "get_context",
-		Description: `Fetch the injection bundle for the start of a session: the global user profile, the project document, and the recent session log. Identify the project with hints (gitRemote > name/path) or a canonical project id; hints resolve and mint server-side.`,
+		Name:        "get_context",
+		Description: `Fetch the session-start bundle: the user profile in full, the list of all memory subjects (path + description + aliases), and this project's area file if identified. Use the listing to decide which other subjects to read with memory_read.`,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args getContextArgs) (*mcp.CallToolResult, any, error) {
 		projectID := args.Project
 		if projectID == "" {
@@ -49,83 +50,155 @@ func New(api *httpapi.Server) *mcp.Server {
 		return textResult(string(out)), nil, nil
 	})
 
-	type rememberArgs struct {
-		Scope     string `json:"scope" jsonschema:"profile or project/<id>"`
-		Key       string `json:"key" jsonschema:"dotted category, e.g. preferences.language or conventions.pkg-manager"`
-		Value     string `json:"value" jsonschema:"the fact, in natural language"`
-		Class     string `json:"klass,omitempty" jsonschema:"static (durable) or dynamic (recent); default dynamic"`
-		Namespace string `json:"namespace,omitempty" jsonschema:"doc namespace for session-log writes, e.g. project/<id>/session-log/2026-07-26"`
-	}
+	// memory_list — the retrieval index.
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "remember",
-		Description: `Write a fact directly without waiting for the nightly pass. Agent-authored records carry source "agent": they are reconciled on the next consolidation run and never override user-pinned facts. Use a session-log namespace at session close to leave a tight "did X, decided Y, next Z" note.`,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args rememberArgs) (*mcp.CallToolResult, any, error) {
-		scope, err := parseScopeArg(args.Scope)
+		Name:        "memory_list",
+		Description: `List all memory subjects: path, kind, description, aliases. The retrieval surface — decide what to read from descriptions alone.`,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
+		listing, err := api.Store().ListSubjects()
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		klass := types.ClassDynamic
-		if args.Class == "static" {
-			klass = types.ClassStatic
-		}
-		rec := &types.Record{
-			Scope:      scope,
-			Key:        args.Key,
-			Value:      args.Value,
-			Confidence: 0.8,
-			Class:      klass,
-			Source:     types.SourceAgent,
-			Status:     types.StatusActive,
-		}
-		if err := api.Store().UpsertRecord(rec); err != nil {
-			return errResult(err), nil, nil
-		}
-		// Session-log notes render under their own namespace immediately;
-		// everything else re-renders its scope so get_context sees it now.
-		if args.Namespace != "" {
-			_ = api.RenderSessionLog(args.Namespace, args.Value)
-		} else {
-			_ = api.RenderScope(scope)
-		}
-		return textResult(fmt.Sprintf("remembered (%s): %s", args.Key, rec.ID)), nil, nil
+		out, _ := json.MarshalIndent(listing, "", "  ")
+		return textResult(string(out)), nil, nil
 	})
 
-	type forgetArgs struct {
-		Namespace string `json:"namespace" jsonschema:"profile/... or project/<id>/..."`
-		Key       string `json:"key" jsonschema:"record key to soft-delete"`
+	// memory_read — read a subject file.
+	type readArgs struct {
+		Path string `json:"path" jsonschema:"subject path: profile, areas/<name>, topics/<name>, people/<name>"`
 	}
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "forget",
-		Description: `Soft-delete all active records at (namespace, key). The records leave rendered documents but stay in the store for audit.`,
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args forgetArgs) (*mcp.CallToolResult, any, error) {
-		scope, err := parseScopeArg(args.Namespace)
+		Name:        "memory_read",
+		Description: `Read one subject file's body and version token. Pass the version to memory_write for safe concurrent edits.`,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args readArgs) (*mcp.CallToolResult, any, error) {
+		kind, name, err := parsePath(args.Path)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		n, err := api.Store().SoftDeleteKey(scope, args.Key)
+		sub, err := api.Store().GetSubject(kind, name)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		return textResult(fmt.Sprintf("forgot %d record(s) at %s", n, args.Key)), nil, nil
+		if sub == nil {
+			return errResult(fmt.Errorf("subject not found: %s", args.Path)), nil, nil
+		}
+		return textResult(fmt.Sprintf("[version: %s]\n%s", sub.Version, sub.Body)), nil, nil
+	})
+
+	// memory_write — create or fully overwrite a subject.
+	type writeArgs struct {
+		Path        string `json:"path" jsonschema:"subject path"`
+		Body        string `json:"body" jsonschema:"full markdown body (bullet lines with provenance tags)"`
+		Description string `json:"description,omitempty" jsonschema:"one-line subject description"`
+		Version     string `json:"version,omitempty" jsonschema:"version token from memory_read, or 'new' to create"`
+	}
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "memory_write",
+		Description: `Create or fully overwrite a subject file. Read first (for the version token) and merge, rather than clobbering. Not an append — omitted lines are deleted.`,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args writeArgs) (*mcp.CallToolResult, any, error) {
+		kind, name, err := parsePath(args.Path)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		existing, err := api.Store().GetSubject(kind, name)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		if args.Version != "" && args.Version != "new" && existing != nil && existing.Version != args.Version {
+			return errResult(fmt.Errorf("version mismatch; re-read %s and merge", args.Path)), nil, nil
+		}
+		sub := existing
+		if sub == nil {
+			sub = &types.Subject{Kind: kind, Name: name}
+		}
+		sub.Body = args.Body
+		if args.Description != "" {
+			sub.Description = args.Description
+		}
+		if sub.Description == "" {
+			sub.Description = name
+		}
+		if err := api.Store().PutSubject(sub, 0); err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult(fmt.Sprintf("wrote %s [version: %s]", args.Path, sub.Version)), nil, nil
+	})
+
+	// memory_append — add one line without resending the file.
+	type appendArgs struct {
+		Path string `json:"path" jsonschema:"subject path"`
+		Line string `json:"line" jsonschema:"one fact to append; a leading '- ' and [stated] tag are added if missing"`
+	}
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "memory_append",
+		Description: `Append a single fact to a subject without resending its whole body. Creates the subject if absent.`,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, any, error) {
+		kind, name, err := parsePath(args.Path)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		sub, err := api.Store().GetSubject(kind, name)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		if sub == nil {
+			sub = &types.Subject{Kind: kind, Name: name, Description: name}
+		}
+		line := strings.TrimSpace(args.Line)
+		if !strings.HasPrefix(line, "-") {
+			line = "- " + line
+		}
+		if sub.Body == "" {
+			sub.Body = line
+		} else {
+			sub.Body = strings.TrimRight(sub.Body, "\n") + "\n" + line
+		}
+		if err := api.Store().PutSubject(sub, 0); err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult(fmt.Sprintf("appended to %s [version: %s]", args.Path, sub.Version)), nil, nil
+	})
+
+	// memory_delete — remove a subject.
+	type deleteArgs struct {
+		Path string `json:"path" jsonschema:"subject path to delete"`
+	}
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "memory_delete",
+		Description: `Delete a whole subject file. Only on explicit user request.`,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteArgs) (*mcp.CallToolResult, any, error) {
+		kind, name, err := parsePath(args.Path)
+		if err != nil {
+			return errResult(err), nil, nil
+		}
+		if err := api.Store().DeleteSubject(kind, name); err != nil {
+			return errResult(err), nil, nil
+		}
+		return textResult("deleted " + args.Path), nil, nil
 	})
 
 	return s
 }
 
-// parseScopeArg accepts "profile", "profile/<doc>", "project/<id>", or
-// "project/<id>/<doc...>" and returns the corresponding scope.
-func parseScopeArg(s string) (types.Scope, error) {
-	parts := strings.Split(strings.Trim(s, "/"), "/")
-	switch parts[0] {
-	case "profile":
-		return types.Scope{Kind: types.ScopeProfile}, nil
-	case "project":
-		if len(parts) < 2 || parts[1] == "" {
-			return types.Scope{}, fmt.Errorf("project scope needs an id: project/<id>")
-		}
-		return types.Scope{Kind: types.ScopeProject, ProjectID: parts[1]}, nil
+// parsePath maps a subject path to (kind, name).
+func parsePath(p string) (types.SubjectKind, string, error) {
+	p = strings.TrimSuffix(strings.Trim(p, "/"), ".md")
+	if p == "profile" || p == "" {
+		return types.KindProfile, "profile", nil
+	}
+	dir, name, ok := strings.Cut(p, "/")
+	if !ok {
+		return "", "", fmt.Errorf("path must be profile, areas/<name>, topics/<name>, or people/<name>")
+	}
+	switch dir {
+	case "areas":
+		return types.KindArea, name, nil
+	case "topics":
+		return types.KindTopic, name, nil
+	case "people":
+		return types.KindPeople, name, nil
 	default:
-		return types.Scope{}, fmt.Errorf("scope must be profile or project/<id>, got %q", s)
+		return "", "", fmt.Errorf("unknown memory folder %q", dir)
 	}
 }
 
@@ -134,10 +207,7 @@ func textResult(text string) *mcp.CallToolResult {
 }
 
 func errResult(err error) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		IsError: true,
-		Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}},
-	}
+	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}}
 }
 
 // HTTPHandler serves the MCP server over streamable HTTP.

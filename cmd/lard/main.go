@@ -35,7 +35,8 @@ func run() error {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return err
 	}
-	st, err := store.Open(dbPath)
+	memDir := envOr("LARD_MEMORY_DIR", defaultMemDir())
+	st, err := store.Open(dbPath, memDir)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -98,4 +99,11 @@ func defaultDBPath() string {
 		return filepath.Join(d, "lard", "lard.db")
 	}
 	return "lard.db"
+}
+
+func defaultMemDir() string {
+	if d, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(d, "lard", "memory")
+	}
+	return "memory"
 }

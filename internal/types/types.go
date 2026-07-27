@@ -1,75 +1,110 @@
-// Package types holds the shared data model for lard: scopes, records,
-// the edge-to-center turn wire contract, and project identity hints.
+// Package types holds the shared data model for lard: the subject-file
+// memory model, the edge-to-center turn wire contract, and project identity
+// hints.
 package types
 
 import "time"
 
-// ScopeKind distinguishes the global user profile from per-project context.
-type ScopeKind string
+// --- Subject-file memory model ---
+
+// SubjectKind is the category of a memory subject, which also picks its
+// on-disk folder.
+type SubjectKind string
 
 const (
-	ScopeProfile ScopeKind = "profile"
-	ScopeProject ScopeKind = "project"
+	KindProfile SubjectKind = "profile" // singleton: durable identity
+	KindArea    SubjectKind = "area"    // one per project / ongoing thing
+	KindTopic   SubjectKind = "topic"   // cross-cutting domain facts
+	KindPeople  SubjectKind = "people"  // one per person
 )
 
-// Scope is where a record lives. Profile scopes have no ProjectID.
-type Scope struct {
-	Kind      ScopeKind `json:"kind"`
-	ProjectID string    `json:"projectId,omitempty"`
+// Subject is one memory file: frontmatter plus a prose body. The body is
+// the human-facing, editable artifact; the store persists it as markdown on
+// disk.
+type Subject struct {
+	Name        string      `json:"name"` // slug, unique; path stem
+	Kind        SubjectKind `json:"kind"`
+	Description string      `json:"description"` // one-line retrieval key
+	Aliases     []string    `json:"aliases,omitempty"`
+	ProjectID   string      `json:"projectId,omitempty"` // links an area to the registry
+	Body        string      `json:"body"`                // markdown, prose bullets
+	Updated     time.Time   `json:"updated"`
+	Version     string      `json:"version"` // content hash for optimistic concurrency
 }
 
-// String renders the scope as the namespace prefix used by documents:
-// "profile" or "project/<id>".
-func (s Scope) String() string {
-	if s.Kind == ScopeProject && s.ProjectID != "" {
-		return "project/" + s.ProjectID
+// Path returns the store-relative path for a subject ("profile.md",
+// "areas/crush.md", ...).
+func (s Subject) Path() string {
+	return SubjectPath(s.Kind, s.Name)
+}
+
+// SubjectPath builds the store-relative path for a (kind, name).
+func SubjectPath(kind SubjectKind, name string) string {
+	switch kind {
+	case KindProfile:
+		return "profile.md"
+	case KindArea:
+		return "areas/" + name + ".md"
+	case KindTopic:
+		return "topics/" + name + ".md"
+	case KindPeople:
+		return "people/" + name + ".md"
+	default:
+		return name + ".md"
 	}
-	return "profile"
 }
 
-// RecordSource is provenance. Authority order: user > batch > agent.
-type RecordSource string
+// ProvenanceTag marks how a fact was learned.
+type ProvenanceTag string
 
 const (
-	SourceBatch RecordSource = "batch"
-	SourceAgent RecordSource = "agent"
-	SourceUser  RecordSource = "user"
+	TagStated   ProvenanceTag = "stated"   // user said it directly
+	TagObserved ProvenanceTag = "observed" // inferred from behavior
+	TagInferred ProvenanceTag = "inferred" // a drawn conclusion
 )
 
-// RecordClass separates stable identity (static) from recent context
-// (dynamic). They decay on different curves.
-type RecordClass string
-
-const (
-	ClassStatic  RecordClass = "static"
-	ClassDynamic RecordClass = "dynamic"
-)
-
-// RecordStatus tracks the reconciliation lifecycle.
-type RecordStatus string
-
-const (
-	StatusActive       RecordStatus = "active"
-	StatusSuperseded   RecordStatus = "superseded"
-	StatusContradicted RecordStatus = "contradicted"
-)
-
-// Record is the atomic unit of memory: one fact, with provenance and edges.
-type Record struct {
-	ID          string       `json:"id"`
-	Scope       Scope        `json:"scope"`
-	Key         string       `json:"key"` // "preferences.formatting"
-	Value       string       `json:"value"`
-	Confidence  float64      `json:"confidence"`
-	Class       RecordClass  `json:"klass"`
-	Source      RecordSource `json:"source"`
-	Status      RecordStatus `json:"status"`
-	Supersedes  []string     `json:"supersedes,omitempty"`
-	Contradicts []string     `json:"contradicts,omitempty"`
-	CreatedAt   time.Time    `json:"createdAt"`
-	UpdatedAt   time.Time    `json:"updatedAt"`
-	LastSeenAt  time.Time    `json:"lastSeenAt"`
+// Fact is one durable observation extracted from a session, persisted so
+// synthesis never has to re-extract. Facts are grouped by (SubjectKind,
+// SubjectName) and synthesized into subject bodies.
+type Fact struct {
+	ID          int64         `json:"id"`
+	Source      string        `json:"source"`    // "crush", ...
+	SessionID   string        `json:"sessionId"` // provenance
+	SubjectKind SubjectKind   `json:"subjectKind"`
+	SubjectName string        `json:"subjectName"`
+	Text        string        `json:"text"`
+	Tag         ProvenanceTag `json:"tag"`
+	Sensitivity string        `json:"sensitivity,omitempty"`
+	SessionDate time.Time     `json:"sessionDate"` // when the fact was said
+	CreatedAt   time.Time     `json:"createdAt"`
 }
+
+// SubjectListing is the lightweight index row shown at session start so a
+// client can decide which files to read.
+type SubjectListing struct {
+	Path        string      `json:"path"`
+	Kind        SubjectKind `json:"kind"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Aliases     []string    `json:"aliases,omitempty"`
+	Updated     time.Time   `json:"updated"`
+}
+
+// --- Extraction candidates ---
+
+// Candidate is a fact extracted from a session's user turns, routed to a
+// subject but not yet persisted.
+type Candidate struct {
+	Text        string `json:"text"`        // the durable statement
+	SubjectKind string `json:"subjectKind"` // profile | area | topic | people
+	SubjectName string `json:"subjectName"` // slug of the target subject
+	Description string `json:"description"` // one-liner if this subject is new
+	Aliases     []string `json:"aliases,omitempty"`
+	Tag         string `json:"tag"`         // stated | observed | inferred
+	Sensitivity string `json:"sensitivity,omitempty"`
+}
+
+// --- Edge-to-center wire contract ---
 
 // ProjectHints are the identity signals a client sends so the service can
 // canonicalize a project without ever trusting a raw path as the id.
@@ -80,8 +115,7 @@ type ProjectHints struct {
 }
 
 // Turn is one normalized turn of a session. In the common path every
-// uploaded turn has role "user"; other roles exist for the optional
-// coreference-context case and non-agent sources.
+// uploaded turn has role "user".
 type Turn struct {
 	Index   int    `json:"index"`
 	Role    string `json:"role"`
@@ -92,40 +126,27 @@ type Turn struct {
 // SessionBatch is one session's turns plus origin context.
 type SessionBatch struct {
 	SessionID    string        `json:"sessionId"`
-	Source       string        `json:"source"` // "crush" | "web-frontend" | ...
+	Source       string        `json:"source"`
 	ProjectHints *ProjectHints `json:"projectHints,omitempty"`
 	StartedAt    string        `json:"startedAt"`
 	EndedAt      string        `json:"endedAt,omitempty"`
 	Turns        []Turn        `json:"turns"`
 }
 
-// IngestRequest is the /ingest envelope: one or more sessions from a
-// single collector.
+// IngestRequest is the /ingest envelope.
 type IngestRequest struct {
 	Collector string         `json:"collector"`
 	Sessions  []SessionBatch `json:"sessions"`
 }
 
-// Candidate is a durable fact extracted from a session's user turns,
-// not yet reconciled against memory.
-type Candidate struct {
-	Observation string  `json:"observation"` // grounded paraphrase of what the user said
-	Fact        string  `json:"fact"`
-	Key         string  `json:"key"` // dotted category
-	ScopeHint   string  `json:"scopeHint"` // "profile" | "project"
-	Class       string  `json:"klass"`     // "static" | "dynamic"
-	Confidence  float64 `json:"confidence"`
-	Sensitivity *string `json:"sensitivity"`
-	SourceTurn  int     `json:"sourceTurn"`
-}
-
-// ContextBundle is what a client injects at session start.
+// ContextBundle is what a client injects at session start: the profile in
+// full, the subject listing, and (for a project session) that project's
+// area file.
 type ContextBundle struct {
-	Profile    string `json:"profile"`
-	Project    string `json:"project,omitempty"`
-	SessionLog string `json:"sessionLog,omitempty"`
-	ProjectID  string `json:"projectId,omitempty"`
-	Created    bool   `json:"created,omitempty"`
+	Profile   string           `json:"profile"`
+	Area      string           `json:"area,omitempty"`
+	Listing   []SubjectListing `json:"listing"`
+	ProjectID string           `json:"projectId,omitempty"`
 }
 
 // Project is the canonical identity that aliases resolve to.

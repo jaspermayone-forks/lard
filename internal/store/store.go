@@ -1,14 +1,20 @@
-// Package store is lard's SQLite persistence layer: records, rendered
-// documents, ingested turns, the project registry, and watermarks.
+// Package store is lard's persistence layer. Subject files are markdown on
+// disk (the human-facing, editable artifact); SQLite holds the machinery:
+// ingested sessions and turns, extracted facts, the project registry, and a
+// derived index of subject frontmatter for fast listing.
 package store
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -23,28 +29,35 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-// Store wraps the SQLite connection.
+// Store wraps the SQLite connection and the on-disk memory directory.
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	memDir string
 }
 
-// Open opens (creating if needed) the database at path and applies migrations.
-func Open(path string) (*Store, error) {
+// Open opens the database at dbPath and roots subject files at memDir.
+func Open(dbPath, memDir string) (*Store, error) {
 	params := url.Values{}
 	params.Set("_pragma", "journal_mode(WAL)")
 	params.Set("_pragma", "foreign_keys(ON)")
 	params.Set("_pragma", "busy_timeout(30000)")
 	params.Set("_txlock", "immediate")
-	dsn := fmt.Sprintf("file:%s?%s", path, params.Encode())
+	dsn := fmt.Sprintf("file:%s?%s", dbPath, params.Encode())
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
+		return nil, fmt.Errorf("open %s: %w", dbPath, err)
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, memDir: memDir}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
+	}
+	for _, sub := range []string{"areas", "topics", "people"} {
+		if err := os.MkdirAll(filepath.Join(memDir, sub), 0o755); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("create memory dir: %w", err)
+		}
 	}
 	return s, nil
 }
@@ -52,20 +65,21 @@ func Open(path string) (*Store, error) {
 // Close closes the underlying connection.
 func (s *Store) Close() error { return s.db.Close() }
 
+// MemDir returns the on-disk root of the subject files.
+func (s *Store) MemDir() string { return s.memDir }
+
 func (s *Store) migrate() error {
 	entries, err := migrations.ReadDir("migrations")
 	if err != nil {
 		return err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
+		return fmt.Errorf("bootstrap schema_version: %w", err)
+	}
 	var version int
-	row := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`)
-	if err := row.Scan(&version); err != nil {
-		// schema_version may not exist yet; bootstrap below.
-		if _, execErr := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); execErr != nil {
-			return fmt.Errorf("bootstrap schema_version: %w", execErr)
-		}
-		version = 0
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
+		return err
 	}
 	for _, e := range entries {
 		var n int
@@ -98,181 +112,7 @@ func (s *Store) migrate() error {
 	return nil
 }
 
-func scopeKey(sc types.Scope) (kind, project string) {
-	return string(sc.Kind), sc.ProjectID
-}
-
-// UpsertRecord inserts or replaces a record.
-func (s *Store) UpsertRecord(r *types.Record) error {
-	if r.ID == "" {
-		r.ID = uuid.NewString()
-	}
-	now := time.Now().UTC()
-	if r.CreatedAt.IsZero() {
-		r.CreatedAt = now
-	}
-	r.UpdatedAt = now
-	if r.LastSeenAt.IsZero() {
-		r.LastSeenAt = now
-	}
-	sup, _ := json.Marshal(r.Supersedes)
-	con, _ := json.Marshal(r.Contradicts)
-	kind, project := scopeKey(r.Scope)
-	// Tolerate zero-value fields from direct construction; the schema has
-	// CHECK constraints and the zero values are never valid.
-	if kind == "" {
-		kind = string(types.ScopeProfile)
-	}
-	if r.Class == "" {
-		r.Class = types.ClassDynamic
-	}
-	if r.Source == "" {
-		r.Source = types.SourceBatch
-	}
-	if r.Status == "" {
-		r.Status = types.StatusActive
-	}
-	if r.Confidence == 0 {
-		r.Confidence = 0.5
-	}
-	_, err := s.db.Exec(`INSERT INTO records
-		(id, scope_kind, project_id, key, value, confidence, klass, source, status, supersedes, contradicts, created_at, updated_at, last_seen_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET
-			value=excluded.value, confidence=excluded.confidence, klass=excluded.klass,
-			source=excluded.source, status=excluded.status, supersedes=excluded.supersedes,
-			contradicts=excluded.contradicts, updated_at=excluded.updated_at, last_seen_at=excluded.last_seen_at`,
-		r.ID, kind, project, r.Key, r.Value, r.Confidence, string(r.Class), string(r.Source), string(r.Status),
-		string(sup), string(con), r.CreatedAt.Unix(), r.UpdatedAt.Unix(), r.LastSeenAt.Unix())
-	return err
-}
-
-var recordCols = `id, scope_kind, project_id, key, value, confidence, klass, source, status, supersedes, contradicts, created_at, updated_at, last_seen_at`
-
-func scanRecord(row interface{ Scan(...any) error }) (*types.Record, error) {
-	var r types.Record
-	var kind, klass, source, status, sup, con string
-	var created, updated, seen int64
-	err := row.Scan(&r.ID, &kind, &r.Scope.ProjectID, &r.Key, &r.Value, &r.Confidence,
-		&klass, &source, &status, &sup, &con, &created, &updated, &seen)
-	if err != nil {
-		return nil, err
-	}
-	r.Scope.Kind = types.ScopeKind(kind)
-	r.Class = types.RecordClass(klass)
-	r.Source = types.RecordSource(source)
-	r.Status = types.RecordStatus(status)
-	_ = json.Unmarshal([]byte(sup), &r.Supersedes)
-	_ = json.Unmarshal([]byte(con), &r.Contradicts)
-	r.CreatedAt = time.Unix(created, 0).UTC()
-	r.UpdatedAt = time.Unix(updated, 0).UTC()
-	r.LastSeenAt = time.Unix(seen, 0).UTC()
-	return &r, nil
-}
-
-// ListRecords returns records matching the filters. Empty scopeKind matches all.
-// status empty means "active".
-func (s *Store) ListRecords(scopeKind, projectID, key, status string) ([]*types.Record, error) {
-	if status == "" {
-		status = string(types.StatusActive)
-	}
-	q := `SELECT ` + recordCols + ` FROM records WHERE 1=1`
-	var args []any
-	if status != "*" {
-		q += ` AND status = ?`
-		args = append(args, status)
-	}
-	if scopeKind != "" {
-		q += ` AND scope_kind = ?`
-		args = append(args, scopeKind)
-	}
-	if projectID != "" {
-		q += ` AND project_id = ?`
-		args = append(args, projectID)
-	}
-	if key != "" {
-		// Prefix match: "preferences.editor" also gathers
-		// "preferences.editor.vim-exrc" so near-identical keys cluster for
-		// reconciliation instead of fragmenting.
-		q += ` AND (key = ? OR key LIKE ?)`
-		args = append(args, key, key+".%")
-	}
-	q += ` ORDER BY key, confidence DESC, updated_at DESC`
-	rows, err := s.db.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []*types.Record
-	for rows.Next() {
-		r, err := scanRecord(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// GetRecord fetches one record by id.
-func (s *Store) GetRecord(id string) (*types.Record, error) {
-	row := s.db.QueryRow(`SELECT `+recordCols+` FROM records WHERE id = ?`, id)
-	r, err := scanRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	return r, err
-}
-
-// SoftDeleteKey marks active records at (scope, key) as superseded.
-func (s *Store) SoftDeleteKey(scope types.Scope, key string) (int64, error) {
-	kind, project := scopeKey(scope)
-	res, err := s.db.Exec(`UPDATE records SET status = ?, updated_at = ?
-		WHERE scope_kind = ? AND project_id = ? AND key = ? AND status = ?`,
-		string(types.StatusSuperseded), time.Now().UTC().Unix(), kind, project, key, string(types.StatusActive))
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// PutDoc upserts a rendered document for a namespace (e.g. "profile/preferences").
-func (s *Store) PutDoc(namespace, body string) error {
-	_, err := s.db.Exec(`INSERT INTO docs (namespace, body, version, updated_at)
-		VALUES (?, ?, 1, ?)
-		ON CONFLICT(namespace) DO UPDATE SET body=excluded.body, version=docs.version+1, updated_at=excluded.updated_at`,
-		namespace, body, time.Now().UTC().Unix())
-	return err
-}
-
-// GetDoc fetches a rendered document. Returns "" if absent.
-func (s *Store) GetDoc(namespace string) (string, error) {
-	var body string
-	err := s.db.QueryRow(`SELECT body FROM docs WHERE namespace = ?`, namespace).Scan(&body)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	return body, err
-}
-
-// ListDocNamespaces lists namespaces under a prefix ("profile" or "project/<id>").
-func (s *Store) ListDocNamespaces(prefix string) ([]string, error) {
-	rows, err := s.db.Query(`SELECT namespace FROM docs WHERE namespace = ? OR namespace LIKE ? ORDER BY namespace`,
-		prefix, prefix+"/%")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			return nil, err
-		}
-		out = append(out, n)
-	}
-	return out, rows.Err()
-}
+// --- Sessions & turns (ingest) ---
 
 // IngestSessions upserts session batches. Turns replace prior turns for
 // (source, session_id): re-uploads of an open session are idempotent.
@@ -321,7 +161,7 @@ func (s *Store) IngestSessions(collector string, sessions []types.SessionBatch) 
 	return n, tx.Commit()
 }
 
-// PendingSession is a session awaiting consolidation.
+// PendingSession is a session awaiting extraction.
 type PendingSession struct {
 	Source    string
 	SessionID string
@@ -331,18 +171,16 @@ type PendingSession struct {
 	Turns     []types.Turn
 }
 
-// ListPendingSessions returns sessions not yet marked consolidated.
-func (s *Store) ListPendingSessions(limit int) ([]*PendingSession, error) {
+// ListUnextractedSessions returns sessions not yet extracted, oldest first.
+func (s *Store) ListUnextractedSessions(limit int) ([]*PendingSession, error) {
 	rows, err := s.db.Query(`SELECT s.source, s.session_id, s.project_hints, s.started_at, s.ended_at
 		FROM sessions s
-		LEFT JOIN consolidated c ON c.source = s.source AND c.session_id = s.session_id
-		WHERE c.session_id IS NULL
+		LEFT JOIN extracted e ON e.source = s.source AND e.session_id = s.session_id
+		WHERE e.session_id IS NULL
 		ORDER BY s.started_at LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
-	// Buffer the session rows before querying turns: the connection pool is
-	// capped at one, so nesting a second query inside the iterator deadlocks.
 	var out []*PendingSession
 	for rows.Next() {
 		var p PendingSession
@@ -390,35 +228,208 @@ func (s *Store) turnsFor(source, sessionID string) ([]types.Turn, error) {
 	return out, rows.Err()
 }
 
-// MarkConsolidated records (source, sessionID) as processed.
-func (s *Store) MarkConsolidated(source, sessionID string) error {
-	_, err := s.db.Exec(`INSERT INTO consolidated (source, session_id, consolidated_at)
-		VALUES (?,?,?) ON CONFLICT(source, session_id) DO NOTHING`,
-		source, sessionID, time.Now().UTC().Unix())
-	return err
-}
+// --- Facts (durable extraction output) ---
 
-// GetWatermark returns the per-source offset (opaque to the store).
-func (s *Store) GetWatermark(source string) (string, error) {
-	var v string
-	err := s.db.QueryRow(`SELECT value FROM watermarks WHERE source = ?`, source).Scan(&v)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+// SaveFacts persists a session's extracted facts and marks the session
+// extracted, atomically. Re-extraction replaces prior facts for the session.
+func (s *Store) SaveFacts(source, sessionID string, sessionDate time.Time, facts []types.Fact) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
 	}
-	return v, err
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM facts WHERE source = ? AND session_id = ?`, source, sessionID); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Unix()
+	for _, f := range facts {
+		if _, err := tx.Exec(`INSERT INTO facts
+			(source, session_id, subject_kind, subject_name, text, tag, sensitivity, session_date, created_at)
+			VALUES (?,?,?,?,?,?,?,?,?)`,
+			source, sessionID, string(f.SubjectKind), f.SubjectName, f.Text, string(f.Tag),
+			f.Sensitivity, sessionDate.UTC().Unix(), now); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`INSERT INTO extracted (source, session_id, extracted_at)
+		VALUES (?,?,?) ON CONFLICT(source, session_id) DO UPDATE SET extracted_at=excluded.extracted_at`,
+		source, sessionID, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// SetWatermark stores the per-source offset.
-func (s *Store) SetWatermark(source, value string) error {
-	_, err := s.db.Exec(`INSERT INTO watermarks (source, value) VALUES (?,?)
-		ON CONFLICT(source) DO UPDATE SET value=excluded.value`, source, value)
+// DirtySubjects returns (kind, name) pairs that have facts newer than the
+// subject's last synthesis — i.e. subjects needing a re-synthesize.
+func (s *Store) DirtySubjects() ([][2]string, error) {
+	rows, err := s.db.Query(`
+		SELECT f.subject_kind, f.subject_name
+		FROM facts f
+		LEFT JOIN subjects sub
+		  ON sub.kind = f.subject_kind AND sub.name = f.subject_name
+		GROUP BY f.subject_kind, f.subject_name
+		HAVING COALESCE(sub.synth_max_fact_id, 0) < MAX(f.id)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]string
+	for rows.Next() {
+		var k, n string
+		if err := rows.Scan(&k, &n); err != nil {
+			return nil, err
+		}
+		out = append(out, [2]string{k, n})
+	}
+	return out, rows.Err()
+}
+
+// FactsForSubject returns all facts for a subject, oldest first, with the
+// max fact id seen (the synthesis watermark to commit afterward).
+func (s *Store) FactsForSubject(kind types.SubjectKind, name string) ([]types.Fact, int64, error) {
+	rows, err := s.db.Query(`SELECT id, source, session_id, subject_kind, subject_name, text, tag, sensitivity, session_date, created_at
+		FROM facts WHERE subject_kind = ? AND subject_name = ? ORDER BY session_date, id`, string(kind), name)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []types.Fact
+	var maxID int64
+	for rows.Next() {
+		var f types.Fact
+		var kk, tag string
+		var sd, ca int64
+		if err := rows.Scan(&f.ID, &f.Source, &f.SessionID, &kk, &f.SubjectName, &f.Text, &tag, &f.Sensitivity, &sd, &ca); err != nil {
+			return nil, 0, err
+		}
+		f.SubjectKind = types.SubjectKind(kk)
+		f.Tag = types.ProvenanceTag(tag)
+		f.SessionDate = time.Unix(sd, 0).UTC()
+		f.CreatedAt = time.Unix(ca, 0).UTC()
+		out = append(out, f)
+		if f.ID > maxID {
+			maxID = f.ID
+		}
+	}
+	return out, maxID, rows.Err()
+}
+
+// --- Subjects (markdown on disk + index) ---
+
+// GetSubject loads a subject by (kind, name), reading its body from disk.
+// Returns nil if the file does not exist.
+func (s *Store) GetSubject(kind types.SubjectKind, name string) (*types.Subject, error) {
+	path := types.SubjectPath(kind, name)
+	body, err := os.ReadFile(filepath.Join(s.memDir, path))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sub := parseSubject(kind, name, string(body))
+	return sub, nil
+}
+
+// PutSubject writes a subject to disk (full overwrite) and refreshes its
+// index row and synthesis watermark. synthFactID is the max fact id folded
+// into this body (0 to leave the watermark unchanged).
+func (s *Store) PutSubject(sub *types.Subject, synthFactID int64) error {
+	sub.Updated = time.Now().UTC()
+	content := renderSubjectFile(sub)
+	sub.Version = hashBody(content)
+	path := filepath.Join(s.memDir, sub.Path())
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	aliases, _ := json.Marshal(sub.Aliases)
+	_, err := s.db.Exec(`INSERT INTO subjects
+		(kind, name, description, aliases, project_id, updated_at, synth_max_fact_id)
+		VALUES (?,?,?,?,?,?,?)
+		ON CONFLICT(kind, name) DO UPDATE SET
+			description=excluded.description, aliases=excluded.aliases,
+			project_id=excluded.project_id, updated_at=excluded.updated_at,
+			synth_max_fact_id=MAX(subjects.synth_max_fact_id, excluded.synth_max_fact_id)`,
+		string(sub.Kind), sub.Name, sub.Description, string(aliases), sub.ProjectID,
+		sub.Updated.Unix(), synthFactID)
 	return err
 }
 
-// Project registry
+// ListSubjects returns the index (no bodies) for the listing surface.
+func (s *Store) ListSubjects() ([]types.SubjectListing, error) {
+	rows, err := s.db.Query(`SELECT kind, name, description, aliases, updated_at FROM subjects ORDER BY kind, name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []types.SubjectListing
+	for rows.Next() {
+		var l types.SubjectListing
+		var kind, aliases string
+		var updated int64
+		if err := rows.Scan(&kind, &l.Name, &l.Description, &aliases, &updated); err != nil {
+			return nil, err
+		}
+		l.Kind = types.SubjectKind(kind)
+		l.Path = types.SubjectPath(l.Kind, l.Name)
+		l.Updated = time.Unix(updated, 0).UTC()
+		_ = json.Unmarshal([]byte(aliases), &l.Aliases)
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
 
-// FindProjectByAlias looks up a project by (kind, value) alias.
-// kind is one of "remote", "path", "name".
+// ResolveSubject finds an existing subject whose name or alias matches the
+// given name (case-insensitive), within a kind. Returns "" if none.
+func (s *Store) ResolveSubject(kind types.SubjectKind, name string) (string, error) {
+	want := strings.ToLower(strings.TrimSpace(name))
+	rows, err := s.db.Query(`SELECT name, aliases FROM subjects WHERE kind = ?`, string(kind))
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var n, aliases string
+		if err := rows.Scan(&n, &aliases); err != nil {
+			return "", err
+		}
+		if strings.ToLower(n) == want {
+			return n, nil
+		}
+		var al []string
+		_ = json.Unmarshal([]byte(aliases), &al)
+		for _, a := range al {
+			if strings.ToLower(a) == want {
+				return n, nil
+			}
+		}
+	}
+	return "", rows.Err()
+}
+
+// DeleteSubject removes a subject's file and index row.
+func (s *Store) DeleteSubject(kind types.SubjectKind, name string) error {
+	if err := os.Remove(filepath.Join(s.memDir, types.SubjectPath(kind, name))); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err := s.db.Exec(`DELETE FROM subjects WHERE kind = ? AND name = ?`, string(kind), name)
+	return err
+}
+
+func hashBody(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// --- Project registry ---
+
 func (s *Store) FindProjectByAlias(kind, value string) (*types.Project, error) {
 	row := s.db.QueryRow(`SELECT p.id, p.display_name, p.created_at FROM projects p
 		JOIN project_aliases a ON a.project_id = p.id
@@ -426,7 +437,6 @@ func (s *Store) FindProjectByAlias(kind, value string) (*types.Project, error) {
 	return s.scanProject(row)
 }
 
-// GetProject fetches a project by id.
 func (s *Store) GetProject(id string) (*types.Project, error) {
 	row := s.db.QueryRow(`SELECT id, display_name, created_at FROM projects WHERE id = ?`, id)
 	return s.scanProject(row)
@@ -465,7 +475,6 @@ func (s *Store) scanProject(row *sql.Row) (*types.Project, error) {
 	return &p, rows.Err()
 }
 
-// CreateProject mints a project and seeds it with the given aliases.
 func (s *Store) CreateProject(displayName string, aliases map[string][]string) (*types.Project, error) {
 	id := uuid.NewString()
 	tx, err := s.db.Begin()
@@ -494,14 +503,12 @@ func (s *Store) CreateProject(displayName string, aliases map[string][]string) (
 	return s.GetProject(id)
 }
 
-// AddAlias binds another alias to a project.
 func (s *Store) AddAlias(projectID, kind, value string) error {
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO project_aliases (kind, value, project_id) VALUES (?,?,?)`,
 		kind, value, projectID)
 	return err
 }
 
-// ListProjects returns all registered projects.
 func (s *Store) ListProjects() ([]*types.Project, error) {
 	rows, err := s.db.Query(`SELECT id FROM projects ORDER BY display_name`)
 	if err != nil {
@@ -531,93 +538,19 @@ func (s *Store) ListProjects() ([]*types.Project, error) {
 	return out, nil
 }
 
-// MergeProjects moves all aliases and records from `fromID` into `intoID`, then deletes `fromID`.
-func (s *Store) MergeProjects(intoID, fromID string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+// --- Watermarks (per-source ingest offset) ---
+
+func (s *Store) GetWatermark(source string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM watermarks WHERE source = ?`, source).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
 	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE OR IGNORE project_aliases SET project_id = ? WHERE project_id = ?`, intoID, fromID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM project_aliases WHERE project_id = ?`, fromID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`UPDATE records SET project_id = ? WHERE project_id = ?`, intoID, fromID); err != nil {
-		return err
-	}
-	// Re-namespace docs from the old project into the new one.
-	rows, err := tx.Query(`SELECT namespace, body FROM docs WHERE namespace LIKE ?`, "project/"+fromID+"/%")
-	if err != nil {
-		return err
-	}
-	type doc struct{ ns, body string }
-	var docs []doc
-	for rows.Next() {
-		var d doc
-		if err := rows.Scan(&d.ns, &d.body); err != nil {
-			rows.Close()
-			return err
-		}
-		docs = append(docs, d)
-	}
-	rows.Close()
-	for _, d := range docs {
-		newNS := strings.Replace(d.ns, "project/"+fromID+"/", "project/"+intoID+"/", 1)
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO docs (namespace, body, version, updated_at) VALUES (?,?,1,?)`,
-			newNS, d.body, time.Now().UTC().Unix()); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`DELETE FROM docs WHERE namespace = ?`, d.ns); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(`DELETE FROM projects WHERE id = ?`, fromID); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return v, err
 }
 
-// ContradictionPair is an unresolved tension between two active records.
-type ContradictionPair struct {
-	A *types.Record `json:"a"`
-	B *types.Record `json:"b"`
-}
-
-// ListContradictions returns pairs of records linked by a contradicts edge,
-// whether active or already flagged contradicted.
-func (s *Store) ListContradictions() ([]ContradictionPair, error) {
-	recs, err := s.ListRecords("", "", "", "*")
-	if err != nil {
-		return nil, err
-	}
-	// Only pairs still standing count: drop anything already superseded.
-	var live []*types.Record
-	for _, r := range recs {
-		if r.Status != types.StatusSuperseded {
-			live = append(live, r)
-		}
-	}
-	recs = live
-	byID := map[string]*types.Record{}
-	for _, r := range recs {
-		byID[r.ID] = r
-	}
-	seen := map[string]bool{}
-	var out []ContradictionPair
-	for _, r := range recs {
-		for _, other := range r.Contradicts {
-			key := r.ID + "|" + other
-			rev := other + "|" + r.ID
-			if seen[key] || seen[rev] {
-				continue
-			}
-			if o, ok := byID[other]; ok {
-				out = append(out, ContradictionPair{A: r, B: o})
-				seen[key] = true
-			}
-		}
-	}
-	return out, nil
+func (s *Store) SetWatermark(source, value string) error {
+	_, err := s.db.Exec(`INSERT INTO watermarks (source, value) VALUES (?,?)
+		ON CONFLICT(source) DO UPDATE SET value=excluded.value`, source, value)
+	return err
 }

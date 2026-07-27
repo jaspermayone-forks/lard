@@ -2,8 +2,9 @@ package pipeline
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/llm"
@@ -11,27 +12,16 @@ import (
 	"github.com/taciturnaxolotl/lard/internal/types"
 )
 
-// Applier executes reconciliation verdicts against the store.
-type Applier struct {
-	store *store.Store
-	// at is the clock records are stamped with: the session's endedAt during
-	// consolidation, wall-clock for live writes.
-	at time.Time
-}
+const (
+	extractConcurrency   = 3
+	synthConcurrency     = 3
+	extractBatchSize     = 100
+)
 
-func (a *Applier) now() time.Time {
-	if !a.at.IsZero() {
-		return a.at
-	}
-	return time.Now().UTC()
-}
-
-// Consolidator runs the nightly pass over pending sessions.
+// Consolidator runs the extract -> group -> synthesize pipeline.
 type Consolidator struct {
-	store *store.Store
-	llm   *llm.Client
-	// Resolve maps project hints to a canonical project id. Wired to the
-	// registry; injected so consolidation never resolves identity itself.
+	store   *store.Store
+	llm     *llm.Client
 	Resolve func(hints *types.ProjectHints) (projectID string, err error)
 }
 
@@ -40,194 +30,234 @@ func New(st *store.Store, client *llm.Client, resolve func(*types.ProjectHints) 
 	return &Consolidator{store: st, llm: client, Resolve: resolve}
 }
 
-const defaultConcurrency = 3
+// Run drains all pending work: extract facts from every unextracted session,
+// then synthesize every dirty subject. Both phases are checkpointed, so a
+// crash or re-run resumes cleanly. limit>0 caps sessions extracted this run.
+func (c *Consolidator) Run(ctx context.Context, limit int) (extracted int, err error) {
+	extracted, err = c.extractPhase(ctx, limit)
+	if err != nil {
+		return extracted, err
+	}
+	if err := c.synthesizePhase(ctx); err != nil {
+		return extracted, err
+	}
+	return extracted, nil
+}
 
-// batchSize caps how many sessions one batch fans out at once.
-const batchSize = 100
-
-// Run drains all pending sessions in batches until none remain (or limit,
-// if positive, is reached). Each batch runs concurrently; documents render
-// and decay applies once per batch. Sessions that fail (e.g. malformed LLM
-// output) are not retried within a single Run to avoid a hot loop; they
-// stay pending for the next scheduled pass.
-func (c *Consolidator) Run(ctx context.Context, limit int) (processed int, err error) {
-	seen := map[string]bool{} // session ids already attempted this Run
+// extractPhase runs extraction across unextracted sessions in parallel,
+// persisting facts per session. Each session is an independent checkpoint.
+func (c *Consolidator) extractPhase(ctx context.Context, limit int) (int, error) {
+	total := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			return processed, err
+			return total, err
 		}
-		remaining := batchSize
-		if limit > 0 {
-			if processed >= limit {
-				return processed, nil
-			}
-			if limit-processed < remaining {
-				remaining = limit - processed
-			}
+		want := extractBatchSize
+		if limit > 0 && limit-total < want {
+			want = limit - total
 		}
-		n, attempted, err := c.runBatch(ctx, remaining, seen)
+		if want <= 0 {
+			return total, nil
+		}
+		sessions, err := c.store.ListUnextractedSessions(want)
 		if err != nil {
-			return processed, err
+			return total, err
 		}
-		processed += n
-		// Stop when a batch attempts no new sessions: either the queue is
-		// empty or everything left is a session we already tried and failed.
-		if attempted == 0 {
-			return processed, nil
+		if len(sessions) == 0 {
+			return total, nil
 		}
-		slog.Info("consolidate: batch complete", "processed", processed)
-	}
-}
+		// The subject listing is shared read-only context for routing.
+		listing, err := c.store.ListSubjects()
+		if err != nil {
+			return total, err
+		}
 
-// runBatch processes up to limit pending sessions concurrently: extract,
-// gate, reconcile, then regenerates touched documents and decays stale
-// records. Sessions in `seen` are skipped (already tried this Run).
-// Returns (succeeded, attempted).
-func (c *Consolidator) runBatch(ctx context.Context, limit int, seen map[string]bool) (processed, attempted int, err error) {
-	if limit <= 0 {
-		limit = batchSize
-	}
-	// Over-fetch so skipping already-seen sessions still fills a batch.
-	all, err := c.store.ListPendingSessions(limit + len(seen))
-	if err != nil {
-		return 0, 0, fmt.Errorf("list pending: %w", err)
-	}
-	var pending []*store.PendingSession
-	for _, s := range all {
-		if seen[s.SessionID] {
-			continue
-		}
-		pending = append(pending, s)
-		if len(pending) >= limit {
-			break
-		}
-	}
-	if len(pending) == 0 {
-		slog.Info("consolidate: no pending sessions")
-		return 0, 0, nil
-	}
-	for _, s := range pending {
-		seen[s.SessionID] = true
-	}
-	attempted = len(pending)
-
-	type result struct {
-		sess   *store.PendingSession
-		err    error
-		scopes map[string]bool
-	}
-
-	sem := make(chan struct{}, defaultConcurrency)
-	resCh := make(chan result, len(pending))
-
-	// Fan out sessions across workers with a small stagger to avoid
-	// thundering-herd rate limits on the LLM provider.
-	for i, sess := range pending {
-		if err := ctx.Err(); err != nil {
-			return processed, attempted, err
-		}
-		// Stagger submissions: first batch goes immediately, then 200ms apart.
-		if i >= defaultConcurrency {
-			time.Sleep(200 * time.Millisecond)
-		}
-		sem <- struct{}{} // acquire slot
-		go func(s *store.PendingSession) {
-			defer func() { <-sem }() // release slot
-
-			applier := &Applier{store: c.store, at: time.Unix(s.EndedAt, 0).UTC()}
-			projectID := ""
-			if s.Hints != nil && c.Resolve != nil {
-				pid, err := c.Resolve(s.Hints)
-				if err != nil {
-					slog.Warn("consolidate: resolve project", "session", s.SessionID, "error", err)
-				} else {
-					projectID = pid
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, extractConcurrency)
+		var mu sync.Mutex
+		done := 0
+		for _, sess := range sessions {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(s *store.PendingSession) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := c.extractSession(ctx, s, listing); err != nil {
+					slog.Error("extract: session failed", "session", s.SessionID, "error", err)
+					// Mark extracted-with-no-facts so a poison session doesn't
+					// wedge the queue; it simply contributes nothing.
+					_ = c.store.SaveFacts(s.Source, s.SessionID, time.Unix(s.EndedAt, 0).UTC(), nil)
+					return
 				}
-			}
-			touched := map[string]bool{}
-			err := c.processSession(ctx, applier, s, projectID, touched)
-			resCh <- result{s, err, touched}
-		}(sess)
-	}
-
-	// Collect results.
-	touchedScopes := map[string]bool{}
-	for range pending {
-		r := <-resCh
-		if r.err != nil {
-			slog.Error("consolidate: session failed", "source", r.sess.Source, "session", r.sess.SessionID, "error", r.err)
-			continue
+				mu.Lock()
+				done++
+				mu.Unlock()
+			}(sess)
 		}
-		if err := c.store.MarkConsolidated(r.sess.Source, r.sess.SessionID); err != nil {
-			return processed, attempted, fmt.Errorf("mark consolidated: %w", err)
-		}
-		processed++
-		for k := range r.scopes {
-			touchedScopes[k] = true
-		}
+		wg.Wait()
+		total += len(sessions)
+		slog.Info("extract: batch complete", "sessions", total, "with_facts", done)
 	}
-
-	// Render all touched scopes once at the end (incremental rendering per-session
-	// would race with parallel workers).
-	for scopeKey := range touchedScopes {
-		if err := c.RenderScope(scopeKey); err != nil {
-			slog.Error("consolidate: render", "scope", scopeKey, "error", err)
-		}
-	}
-
-	if err := c.Decay(); err != nil {
-		slog.Error("consolidate: decay", "error", err)
-	}
-	return processed, attempted, nil
 }
 
-func (c *Consolidator) processSession(ctx context.Context, applier *Applier, sess *store.PendingSession, projectID string, touched map[string]bool) error {
-	batch := &types.SessionBatch{
-		SessionID: sess.SessionID,
-		Source:    sess.Source,
-		Turns:     sess.Turns,
+func (c *Consolidator) extractSession(ctx context.Context, s *store.PendingSession, listing []types.SubjectListing) error {
+	projectName := ""
+	projectID := ""
+	if s.Hints != nil {
+		if c.Resolve != nil {
+			if pid, err := c.Resolve(s.Hints); err == nil {
+				projectID = pid
+			}
+		}
+		projectName = s.Hints.Name
+		if projectName == "" && s.Hints.GitRemote != "" {
+			projectName = deriveName(s.Hints.GitRemote)
+		}
 	}
-	cands, err := Extract(ctx, c.llm, batch)
+	batch := &types.SessionBatch{
+		SessionID:    s.SessionID,
+		Source:       s.Source,
+		Turns:        s.Turns,
+		ProjectHints: &types.ProjectHints{Name: projectName},
+	}
+	cands, err := Extract(ctx, c.llm, batch, listing)
 	if err != nil {
 		return err
 	}
-	// Fetch the current profile doc for scope-routing context.
-	profileCtx, _ := c.store.GetDoc("profile/preferences")
-	if profileCtx == "" {
-		profileCtx, _ = c.store.GetDoc("profile/identity")
+	// The session's own project slug: only the area matching it gets linked
+	// to the registry id. Areas merely mentioned in passing stay unlinked.
+	sessionSlug := slugify(projectName)
+	sessionDate := time.Unix(s.EndedAt, 0).UTC()
+	var facts []types.Fact
+	for _, cand := range cands {
+		if cand.Sensitivity != "" && sensitivityBlocklist[cand.Sensitivity] {
+			continue
+		}
+		kind := types.SubjectKind(cand.SubjectKind)
+		name := cand.SubjectName
+		if kind == types.KindProfile {
+			name = "profile"
+		} else {
+			name = slugify(name)
+		}
+		if name == "" {
+			continue
+		}
+		tag := types.ProvenanceTag(cand.Tag)
+		if tag == "" {
+			tag = types.TagStated
+		}
+		facts = append(facts, types.Fact{
+			Source:      s.Source,
+			SessionID:   s.SessionID,
+			SubjectKind: kind,
+			SubjectName: name,
+			Text:        cand.Text,
+			Tag:         tag,
+		})
+		// Link the area to the registry only when it IS the session's project.
+		linkID := ""
+		if kind == types.KindArea && sessionSlug != "" && name == sessionSlug {
+			linkID = projectID
+		}
+		c.ensureSubject(kind, name, cand.Description, cand.Aliases, linkID)
 	}
-	gated := Gate(cands, projectID, profileCtx)
-	if len(gated) == 0 {
+	return c.store.SaveFacts(s.Source, s.SessionID, sessionDate, facts)
+}
+
+// ensureSubject creates a placeholder subject file if none exists yet, so it
+// appears in the listing immediately. Synthesis fills the body later.
+func (c *Consolidator) ensureSubject(kind types.SubjectKind, name, desc string, aliases []string, projectID string) {
+	existing, err := c.store.ResolveSubject(kind, name)
+	if err == nil && existing != "" {
+		return
+	}
+	sub, err := c.store.GetSubject(kind, name)
+	if err == nil && sub != nil {
+		return
+	}
+	newSub := &types.Subject{
+		Kind:        kind,
+		Name:        name,
+		Description: desc,
+		Aliases:     aliases,
+		Body:        "",
+	}
+	if kind == types.KindArea {
+		newSub.ProjectID = projectID
+	}
+	_ = c.store.PutSubject(newSub, 0)
+}
+
+// synthesizePhase rewrites every subject that has facts newer than its last
+// synthesis, in parallel across subjects (each writes a distinct file).
+func (c *Consolidator) synthesizePhase(ctx context.Context) error {
+	dirty, err := c.store.DirtySubjects()
+	if err != nil {
+		return err
+	}
+	if len(dirty) == 0 {
+		slog.Info("synthesize: nothing dirty")
 		return nil
 	}
-
-	// Attach neighbors (active records at the same scope+key).
-	var withNeighbors []CandidateWithNeighbors
-	for i, g := range gated {
-		neighbors, err := c.store.ListRecords(string(g.Scope.Kind), g.Scope.ProjectID, g.Candidate.Key, string(types.StatusActive))
-		if err != nil {
-			return err
-		}
-		withNeighbors = append(withNeighbors, CandidateWithNeighbors{Index: i, Candidate: g, Neighbors: neighbors})
-		touched[g.Scope.String()] = true
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, synthConcurrency)
+	var mu sync.Mutex
+	var ok, failed int
+	for _, d := range dirty {
+		kind, name := types.SubjectKind(d[0]), d[1]
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(kind types.SubjectKind, name string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := c.synthesizeSubject(ctx, kind, name)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failed++
+				slog.Error("synthesize: subject failed", "kind", kind, "name", name, "error", err)
+				return
+			}
+			ok++
+			slog.Info("synthesize: subject done", "kind", kind, "name", name, "progress", ok+failed, "total", len(dirty))
+		}(kind, name)
 	}
+	wg.Wait()
+	slog.Info("synthesize: complete", "subjects", len(dirty), "written", ok, "failed", failed)
+	return nil
+}
 
-	verdicts, err := Classify(ctx, c.llm, withNeighbors)
+func (c *Consolidator) synthesizeSubject(ctx context.Context, kind types.SubjectKind, name string) error {
+	facts, maxID, err := c.store.FactsForSubject(kind, name)
 	if err != nil {
 		return err
 	}
-	byIndex := map[int]Verdict{}
-	for _, v := range verdicts {
-		byIndex[v.CandidateIndex] = v
+	if len(facts) == 0 {
+		return nil
 	}
-	for _, wn := range withNeighbors {
-		v, ok := byIndex[wn.Index]
-		if !ok {
-			v = Verdict{CandidateIndex: wn.Index, Action: "NEW"}
-		}
-		if err := applier.Apply(v, wn.Candidate, wn.Neighbors); err != nil {
-			slog.Error("consolidate: apply", "key", wn.Candidate.Candidate.Key, "error", err)
-		}
+	sub, err := c.store.GetSubject(kind, name)
+	if err != nil {
+		return err
 	}
-	return nil
+	if sub == nil {
+		sub = &types.Subject{Kind: kind, Name: name}
+	}
+	body, err := Synthesize(ctx, c.llm, sub, facts)
+	if err != nil {
+		return err
+	}
+	sub.Body = body
+	if sub.Description == "" {
+		sub.Description = name
+	}
+	return c.store.PutSubject(sub, maxID)
+}
+
+func deriveName(remote string) string {
+	r := NormalizeRemote(remote)
+	if i := strings.LastIndex(r, "/"); i >= 0 && i < len(r)-1 {
+		return r[i+1:]
+	}
+	return r
 }
