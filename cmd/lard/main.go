@@ -10,12 +10,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/auth"
 	"github.com/taciturnaxolotl/lard/internal/collector"
+	"github.com/taciturnaxolotl/lard/internal/config"
 	"github.com/taciturnaxolotl/lard/internal/dotenv"
 	"github.com/taciturnaxolotl/lard/internal/httpapi"
 	"github.com/taciturnaxolotl/lard/internal/llm"
@@ -38,12 +38,30 @@ func run() error {
 	// missed load would silently leave the service open.
 	dotenv.LoadDefault()
 
-	dbPath := envOr("LARD_DB", defaultDBPath())
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+	// Load configuration from TOML file (if present) with env var overrides.
+	configPath := os.Getenv("LARD_CONFIG")
+	if configPath == "" {
+		if d, err := os.UserConfigDir(); err == nil {
+			configPath = filepath.Join(d, "lard", "config.toml")
+		}
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	// Fill in defaults for paths if not set.
+	if cfg.DB == "" {
+		cfg.DB = defaultDBPath()
+	}
+	if cfg.MemoryDir == "" {
+		cfg.MemoryDir = defaultMemDir()
+	}
+
+	if err := os.MkdirAll(filepath.Dir(cfg.DB), 0o700); err != nil {
 		return err
 	}
-	memDir := envOr("LARD_MEMORY_DIR", defaultMemDir())
-	st, err := store.Open(dbPath, memDir)
+	st, err := store.Open(cfg.DB, cfg.MemoryDir)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -61,35 +79,35 @@ func run() error {
 	api := httpapi.New(st, llmClient)
 	// Consolidate on its own once uploads go quiet, so a remote collector
 	// feeding this server keeps memory current with nobody poking an endpoint.
-	if after := envDuration("LARD_CONSOLIDATE_AFTER", httpapi.DefaultConsolidateAfter); after > 0 {
-		api.EnableAutoConsolidate(after, envDuration("LARD_CONSOLIDATE_MAX_WAIT", httpapi.DefaultConsolidateMaxWait))
+	if after := cfg.Consolidate.ConsolidateAfter(); after > 0 {
+		api.EnableAutoConsolidate(after, cfg.Consolidate.ConsolidateMaxWait())
 		defer api.StopAutoConsolidate()
 	}
 	mcpSrv := mcpserver.New(api)
 
-	cfg := auth.Config{
-		Mode:              auth.Mode(envOr("LARD_AUTH", string(auth.ModeNone))),
-		Token:             os.Getenv("LARD_TOKEN"),
-		IndikoURL:         envOr("LARD_INDIKO_URL", "https://indiko.dunkirk.sh"),
-		PublicURL:         os.Getenv("LARD_PUBLIC_URL"),
-		AllowedClientIDs:  envList("LARD_OAUTH_CLIENT_IDS"),
-		AllowedUsers:      envList("LARD_OAUTH_USERS"),
-		RequiredScopes:    envList("LARD_OAUTH_SCOPES"),
-		CollectorClientID: os.Getenv("LARD_COLLECTOR_CLIENT_ID"),
+	authCfg := auth.Config{
+		Mode:              auth.Mode(cfg.Auth.Mode),
+		Token:             cfg.Auth.Token,
+		IndikoURL:         cfg.Auth.IndikoURL,
+		PublicURL:         cfg.Auth.PublicURL,
+		AllowedClientIDs:  cfg.Auth.AllowedClientIDs,
+		AllowedUsers:      cfg.Auth.AllowedUsers,
+		RequiredScopes:    cfg.Auth.RequiredScopes,
+		CollectorClientID: cfg.Auth.CollectorClientID,
 	}
 
 	// The collector registration: which OAuth client edge collectors adopt.
 	// Login itself is the device grant against the authorization server, so
 	// this server only publishes the identity.
 	collectorCfg := collector.Config{
-		ClientID: os.Getenv("LARD_COLLECTOR_CLIENT_ID"),
-		Scopes:   envList("LARD_COLLECTOR_SCOPES"),
+		ClientID: cfg.Collector.ClientID,
+		Scopes:   cfg.Collector.Scopes,
 	}
 	collectorH := collector.New(collectorCfg)
 	if collectorCfg.Configured() {
 		slog.Info("collector registration published", "client_id", collectorCfg.ClientID)
 	}
-	for _, warn := range cfg.Validate() {
+	for _, warn := range authCfg.Validate() {
 		slog.Warn("auth: " + warn)
 	}
 
@@ -98,16 +116,15 @@ func run() error {
 	// The trailing slash covers RFC 9728's path-suffixed documents (e.g.
 	// /.well-known/oauth-protected-resource/mcp), which is what MCP clients
 	// actually request.
-	mux.Handle(auth.PathProtectedResource, auth.ProtectedResourceMetadata(cfg))
-	mux.Handle(auth.PathProtectedResource+"/", auth.ProtectedResourceMetadata(cfg))
-	mux.Handle(auth.PathAuthServer, auth.AuthServerMetadata(cfg))
+	mux.Handle(auth.PathProtectedResource, auth.ProtectedResourceMetadata(authCfg))
+	mux.Handle(auth.PathProtectedResource+"/", auth.ProtectedResourceMetadata(authCfg))
+	mux.Handle(auth.PathAuthServer, auth.AuthServerMetadata(authCfg))
 	mux.HandleFunc("GET "+auth.PathCollector, collectorH.Register)
 	mux.Handle("/", api.Handler())
 
-	addr := envOr("LARD_ADDR", ":7477")
 	srv := &http.Server{
-		Addr:              addr,
-		Handler:           auth.Middleware(cfg, mux),
+		Addr:              cfg.Addr,
+		Handler:           auth.Middleware(authCfg, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -118,51 +135,11 @@ func run() error {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("lard listening", "addr", addr, "db", dbPath, "memory", memDir, "auth", cfg.Mode, "mcp", addr+"/mcp")
+	slog.Info("lard listening", "addr", cfg.Addr, "db", cfg.DB, "memory", cfg.MemoryDir, "auth", authCfg.Mode, "mcp", cfg.Addr+"/mcp")
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// envList reads a comma-separated env var into a trimmed, non-empty slice.
-func envList(key string) []string {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return nil
-	}
-	var out []string
-	for _, part := range strings.Split(raw, ",") {
-		if p := strings.TrimSpace(part); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// envDuration reads a Go duration (e.g. "5m"). "off" or "0" disables the
-// feature by returning zero; an unparseable value falls back to the default.
-func envDuration(key string, fallback time.Duration) time.Duration {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback
-	}
-	if raw == "off" || raw == "never" || raw == "0" {
-		return 0
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil {
-		slog.Warn("ignoring unparseable duration", "key", key, "value", raw)
-		return fallback
-	}
-	return d
 }
 
 func defaultDBPath() string {

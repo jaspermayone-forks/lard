@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pelletier/go-toml/v2"
 	"github.com/taciturnaxolotl/lard/internal/xdg"
 )
 
@@ -53,9 +54,9 @@ func (t *OAuthToken) expired() bool {
 	return time.Now().After(t.Expiry.Add(-time.Minute))
 }
 
-// DefaultConfigPath is ~/.config/lard/client.json.
+// DefaultConfigPath is ~/.config/lard/client.toml.
 func DefaultConfigPath() string {
-	return xdg.ConfigPath("client.json")
+	return xdg.ConfigPath("client.toml")
 }
 
 // LoadConfig reads the config file, tolerating absence, then lets the
@@ -68,7 +69,7 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	if err == nil {
-		if err := json.Unmarshal(b, cfg); err != nil {
+		if err := toml.Unmarshal(b, cfg); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
 		}
 	}
@@ -91,7 +92,7 @@ func (c *Config) Save(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(c, "", "  ")
+	b, err := toml.Marshal(c)
 	if err != nil {
 		return err
 	}
