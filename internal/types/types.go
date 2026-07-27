@@ -3,7 +3,11 @@
 // hints.
 package types
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
 // --- Subject-file memory model ---
 
@@ -27,9 +31,14 @@ type Subject struct {
 	Description string      `json:"description"` // one-line retrieval key
 	Aliases     []string    `json:"aliases,omitempty"`
 	ProjectID   string      `json:"projectId,omitempty"` // links an area to the registry
-	Body        string      `json:"body"`                // markdown, prose bullets
-	Updated     time.Time   `json:"updated"`
-	Version     string      `json:"version"` // content hash for optimistic concurrency
+	// Repos are the subject's git remotes, normalized. A list because one
+	// project often lives in several places at once (a canonical repo plus
+	// mirrors), and recorded in the file so a subject names its own code
+	// without a registry lookup.
+	Repos   []string  `json:"repos,omitempty"`
+	Body    string    `json:"body"` // markdown, prose bullets
+	Updated time.Time `json:"updated"`
+	Version string    `json:"version"` // content hash for optimistic concurrency
 }
 
 // Path returns the store-relative path for a subject ("profile.md",
@@ -157,4 +166,27 @@ type Project struct {
 	Paths       []string `json:"paths"`
 	Names       []string `json:"names"`
 	CreatedAt   string   `json:"createdAt"`
+}
+
+// StringList decodes from either a JSON string or an array of strings, so a
+// caller passing a single git remote need not remember to wrap it in
+// brackets. Both of these are accepted:
+//
+//	"repos": "github.com/org/repo"
+//	"repos": ["github.com/org/repo", "tangled.org/who/repo"]
+type StringList []string
+
+// UnmarshalJSON accepts a bare string or an array of strings.
+func (l *StringList) UnmarshalJSON(data []byte) error {
+	var one string
+	if err := json.Unmarshal(data, &one); err == nil {
+		*l = StringList{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(data, &many); err != nil {
+		return fmt.Errorf("expected a string or an array of strings: %w", err)
+	}
+	*l = many
+	return nil
 }

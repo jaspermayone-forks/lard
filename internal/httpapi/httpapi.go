@@ -186,10 +186,11 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Body        string   `json:"body"`
-		Description string   `json:"description"`
-		Aliases     []string `json:"aliases"`
-		Version     string   `json:"version"` // optimistic concurrency
+		Body        string           `json:"body"`
+		Description string           `json:"description"`
+		Aliases     types.StringList `json:"aliases"`
+		Repos       types.StringList `json:"repos"`   // one remote or many; areas also get registry-linked
+		Version     string           `json:"version"` // optimistic concurrency
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, err)
@@ -214,6 +215,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Aliases != nil {
 		sub.Aliases = body.Aliases
+	}
+	if body.Repos != nil {
+		if _, err := pipeline.AttachRepos(s.registry, sub, body.Repos); err != nil {
+			writeErr(w, 500, err)
+			return
+		}
 	}
 	if err := s.st.PutSubject(sub, 0); err != nil {
 		writeErr(w, 500, err)

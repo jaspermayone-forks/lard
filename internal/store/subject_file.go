@@ -19,6 +19,9 @@ func renderSubjectFile(sub *types.Subject) string {
 	if len(sub.Aliases) > 0 {
 		fmt.Fprintf(&b, "aliases: [%s]\n", strings.Join(sub.Aliases, ", "))
 	}
+	if len(sub.Repos) > 0 {
+		fmt.Fprintf(&b, "repos: [%s]\n", strings.Join(sub.Repos, ", "))
+	}
 	if sub.ProjectID != "" {
 		fmt.Fprintf(&b, "project_id: %s\n", sub.ProjectID)
 	}
@@ -85,17 +88,26 @@ func parseFrontmatter(fm string, sub *types.Subject) {
 		case "project_id":
 			sub.ProjectID = val
 		case "aliases":
-			val = strings.TrimPrefix(val, "[")
-			val = strings.TrimSuffix(val, "]")
-			for _, a := range strings.Split(val, ",") {
-				if a = strings.TrimSpace(a); a != "" {
-					sub.Aliases = append(sub.Aliases, a)
-				}
-			}
+			sub.Aliases = parseListValue(val)
+		case "repos":
+			sub.Repos = parseListValue(val)
 		case "updated":
 			if t, err := time.Parse(time.RFC3339, val); err == nil {
 				sub.Updated = t
 			}
 		}
 	}
+}
+
+// parseListValue reads a bracketed, comma-separated frontmatter value.
+func parseListValue(val string) []string {
+	val = strings.TrimPrefix(val, "[")
+	val = strings.TrimSuffix(val, "]")
+	var out []string
+	for _, v := range strings.Split(val, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
 }

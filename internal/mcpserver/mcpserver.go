@@ -13,6 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/taciturnaxolotl/lard/internal/httpapi"
+	"github.com/taciturnaxolotl/lard/internal/pipeline"
 	"github.com/taciturnaxolotl/lard/internal/types"
 )
 
@@ -87,14 +88,16 @@ func New(api *httpapi.Server) *mcp.Server {
 
 	// memory_write — create or fully overwrite a subject.
 	type writeArgs struct {
-		Path        string `json:"path" jsonschema:"subject path"`
-		Body        string `json:"body" jsonschema:"full markdown body (bullet lines with provenance tags)"`
-		Description string `json:"description,omitempty" jsonschema:"one-line subject description"`
-		Version     string `json:"version,omitempty" jsonschema:"version token from memory_read, or 'new' to create"`
+		Path        string   `json:"path" jsonschema:"subject path"`
+		Body        string   `json:"body" jsonschema:"full markdown body (bullet lines with provenance tags)"`
+		Description string   `json:"description,omitempty" jsonschema:"one-line subject description"`
+		Aliases     []string `json:"aliases,omitempty" jsonschema:"other names this subject goes by; replaces the existing set"`
+		Repos       []string `json:"repos,omitempty" jsonschema:"git remote urls for this subject; any form (ssh or https) is normalized. list all of them when a project has mirrors; the first is treated as canonical. replaces the existing set"`
+		Version     string   `json:"version,omitempty" jsonschema:"version token from memory_read, or 'new' to create"`
 	}
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "memory_write",
-		Description: `Create or fully overwrite a subject file. Read first (for the version token) and merge, rather than clobbering. Not an append — omitted lines are deleted.`,
+		Description: `Create or fully overwrite a subject file. Read first (for the version token) and merge, rather than clobbering. Not an append — omitted lines are deleted. Passing repos on an area also links it to the project registry.`,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args writeArgs) (*mcp.CallToolResult, any, error) {
 		kind, name, err := parsePath(args.Path)
 		if err != nil {
@@ -115,13 +118,25 @@ func New(api *httpapi.Server) *mcp.Server {
 		if args.Description != "" {
 			sub.Description = args.Description
 		}
+		if args.Aliases != nil {
+			sub.Aliases = args.Aliases
+		}
 		if sub.Description == "" {
 			sub.Description = name
+		}
+		if args.Repos != nil {
+			if _, err := pipeline.AttachRepos(api.Registry(), sub, args.Repos); err != nil {
+				return errResult(err), nil, nil
+			}
 		}
 		if err := api.Store().PutSubject(sub, 0); err != nil {
 			return errResult(err), nil, nil
 		}
-		return textResult(fmt.Sprintf("wrote %s [version: %s]", args.Path, sub.Version)), nil, nil
+		msg := fmt.Sprintf("wrote %s [version: %s]", args.Path, sub.Version)
+		if len(sub.Repos) > 0 {
+			msg += "\nrepos: " + strings.Join(sub.Repos, ", ")
+		}
+		return textResult(msg), nil, nil
 	})
 
 	// memory_append — add one line without resending the file.

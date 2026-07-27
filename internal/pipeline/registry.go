@@ -98,6 +98,16 @@ func (r *Registry) Resolve(hints *types.ProjectHints) (string, error) {
 	return p.ID, nil
 }
 
+// AddRemoteAlias binds an additional git remote to an existing project, so a
+// project with several mirrors resolves to the same id from any of them.
+func (r *Registry) AddRemoteAlias(projectID, remote string) error {
+	remote = NormalizeRemote(remote)
+	if projectID == "" || remote == "" {
+		return nil
+	}
+	return r.store.AddAlias(projectID, "remote", remote)
+}
+
 // bindLearned attaches any new hints as aliases on an existing project so
 // later sessions resolve faster and from more signals.
 func (r *Registry) bindLearned(projectID, remote string, hints *types.ProjectHints) {
