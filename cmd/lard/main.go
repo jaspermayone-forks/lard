@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -80,40 +78,16 @@ func run() error {
 		CollectorClientID: os.Getenv("LARD_COLLECTOR_CLIENT_ID"),
 	}
 
-	// The collector registration: what identity edge collectors adopt, and
-	// whether this server exchanges their codes for them.
+	// The collector registration: which OAuth client edge collectors adopt.
+	// Login itself is the device grant against the authorization server, so
+	// this server only publishes the identity.
 	collectorCfg := collector.Config{
-		ClientID:     os.Getenv("LARD_COLLECTOR_CLIENT_ID"),
-		ClientSecret: os.Getenv("LARD_COLLECTOR_CLIENT_SECRET"),
-		Ports:        envPorts("LARD_COLLECTOR_PORTS"),
-		Scopes:       envList("LARD_COLLECTOR_SCOPES"),
+		ClientID: os.Getenv("LARD_COLLECTOR_CLIENT_ID"),
+		Scopes:   envList("LARD_COLLECTOR_SCOPES"),
 	}
-	// The brokered device login needs both endpoints up front: this server, not
-	// the collector, is the one that talks to the authorization server.
-	var deviceCfg collector.DeviceConfig
+	collectorH := collector.New(collectorCfg)
 	if collectorCfg.Configured() {
-		if meta, err := discoverAuthMetadata(ctx, cfg.IndikoURL); err != nil {
-			slog.Warn("collector: cannot discover auth endpoints; brokered login disabled", "error", err)
-			collectorCfg.ClientSecret = ""
-		} else {
-			collectorCfg.TokenEndpoint = meta.TokenEndpoint
-			deviceCfg = collector.DeviceConfig{
-				PublicURL:             cfg.PublicURL,
-				AuthorizationEndpoint: meta.AuthorizationEndpoint,
-			}
-		}
-	}
-	collectorH := collector.New(collectorCfg, deviceCfg, auth.PathCollector)
-	if collectorCfg.Configured() {
-		slog.Info("collector registration published",
-			"client_id", collectorCfg.ClientID,
-			"confidential", collectorCfg.Confidential(),
-			"device_flow", collectorH.DeviceAvailable())
-		if uri := collectorH.CallbackURI(); uri != "" {
-			slog.Info("register this redirect URI with your auth provider", "redirect_uri", uri)
-		} else if cfg.PublicURL == "" {
-			slog.Warn("brokered device login needs LARD_PUBLIC_URL set to this server's external URL")
-		}
+		slog.Info("collector registration published", "client_id", collectorCfg.ClientID)
 	}
 	for _, warn := range cfg.Validate() {
 		slog.Warn("auth: " + warn)
@@ -128,13 +102,6 @@ func run() error {
 	mux.Handle(auth.PathProtectedResource+"/", auth.ProtectedResourceMetadata(cfg))
 	mux.Handle(auth.PathAuthServer, auth.AuthServerMetadata(cfg))
 	mux.HandleFunc("GET "+auth.PathCollector, collectorH.Register)
-	mux.HandleFunc("POST "+auth.PathCollector+"/exchange", collectorH.Exchange)
-	mux.HandleFunc("POST "+auth.PathCollector+"/refresh", collectorH.Refresh)
-	// Brokered device login: the collector polls, the user's browser visits.
-	mux.HandleFunc("POST "+auth.PathCollector+collector.PathDevice, collectorH.StartDevice)
-	mux.HandleFunc("POST "+auth.PathCollector+collector.PathDeviceToken, collectorH.PollDevice)
-	mux.HandleFunc("GET "+auth.PathCollector+collector.PathVerify, collectorH.Verify)
-	mux.HandleFunc("GET "+auth.PathCollector+collector.PathCallback, collectorH.Callback)
 	mux.Handle("/", api.Handler())
 
 	addr := envOr("LARD_ADDR", ":7477")
@@ -210,55 +177,4 @@ func defaultMemDir() string {
 		return filepath.Join(d, "lard", "memory")
 	}
 	return "memory"
-}
-
-// envPorts reads a comma-separated list of port numbers.
-func envPorts(key string) []int {
-	var out []int
-	for _, s := range envList(key) {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 && n < 65536 {
-			out = append(out, n)
-		} else {
-			slog.Warn("ignoring invalid port", "key", key, "value", s)
-		}
-	}
-	return out
-}
-
-// authMetadata is the subset of RFC 8414 metadata the collector flows need.
-type authMetadata struct {
-	AuthorizationEndpoint string `json:"authorization_endpoint"`
-	TokenEndpoint         string `json:"token_endpoint"`
-}
-
-// discoverAuthMetadata reads the authorization server's metadata, so no
-// endpoint path is hardcoded and swapping providers needs no code change.
-func discoverAuthMetadata(ctx context.Context, authServerURL string) (*authMetadata, error) {
-	if authServerURL == "" {
-		return nil, errors.New("no authorization server configured")
-	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	url := strings.TrimRight(authServerURL, "/") + auth.PathAuthServer
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s returned %d", url, resp.StatusCode)
-	}
-	var meta authMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
-		return nil, err
-	}
-	if meta.TokenEndpoint == "" || meta.AuthorizationEndpoint == "" {
-		return nil, errors.New("metadata is missing endpoints")
-	}
-	return &meta, nil
 }

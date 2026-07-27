@@ -5,4 +5,5 @@ crush.json
 *.db-wal
 /lard
 /lard-client
+/bin/
 /memory

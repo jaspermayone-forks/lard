@@ -46,6 +46,7 @@ Start with 'lard-client login', then 'lard-client backfill'.`,
 	}
 	root.AddCommand(
 		loginCmd(),
+		logoutCmd(),
 		backfillCmd(),
 		syncCmd(),
 		daemonCmd(),
@@ -73,7 +74,7 @@ authorize. On a headless machine pass --url and --token instead.`,
 			if err != nil {
 				return err
 			}
-			printConnected(cmd.Context(), cfg, opts.CallbackPort)
+			printConnected(cfg)
 			return nil
 		},
 	}
@@ -81,26 +82,27 @@ authorize. On a headless machine pass --url and --token instead.`,
 	f.StringVar(&opts.URL, "url", "", "server base URL (asked for if omitted)")
 	f.StringVar(&opts.Token, "token", "", "shared secret instead of the browser login")
 	f.StringSliceVar(&opts.Roots, "root", nil, "directory to scan for Crush sessions (repeatable)")
-	f.IntVar(&opts.CallbackPort, "port", client.CallbackPort, "localhost port for the OAuth callback")
 	f.BoolVar(&opts.NoBrowser, "no-browser", false, "print the authorization URL instead of opening it")
+	f.BoolVarP(&opts.Force, "force", "f", false, "re-authenticate, revoking the old grant first")
 	return cmd
 }
 
-func printConnected(ctx context.Context, cfg *client.Config, port int) {
-	fmt.Printf("Connected to %s via %s.\n", cfg.URL, cfg.AuthMode())
-	// Only mention the client id when we had to invent one, since that is the
-	// case where the operator must add it to the server's allowlist. A
-	// server-published id is trusted by definition.
-	if cfg.AuthMode() == "oauth" {
-		if _, err := client.FetchRegistration(ctx, cfg.URL); err != nil {
-			if port <= 0 {
-				port = client.CallbackPort
-			}
-			fmt.Printf("OAuth client id: %s\n", client.ClientID(port))
-			fmt.Println("  This server publishes no collector registration, so add that id to")
-			fmt.Println("  its LARD_OAUTH_CLIENT_IDS, or set LARD_COLLECTOR_CLIENT_ID there instead.")
-		}
+func logoutCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "logout",
+		Short: "Forget this machine's credentials",
+		Long: `Revoke the refresh token at the authorization server and remove the
+saved credentials. The server URL and roots are kept, so 'lard-client login'
+only has to re-authenticate.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return setup.Logout(cmd.Context())
+		},
 	}
+}
+
+func printConnected(cfg *client.Config) {
+	fmt.Printf("Connected to %s via %s.\n", cfg.URL, cfg.AuthMode())
 	fmt.Printf("Saved %s\n\nNext: lard-client backfill\n", client.DefaultConfigPath())
 }
 

@@ -33,11 +33,12 @@ func Interactive() bool {
 // Options carry anything already supplied on the command line, so the form
 // only asks for what is genuinely missing.
 type Options struct {
-	URL          string
-	Token        string
-	Roots        []string
-	CallbackPort int
-	NoBrowser    bool
+	URL       string
+	Token     string
+	Roots     []string
+	NoBrowser bool
+	// Force re-authenticates even if the saved credentials still verify.
+	Force bool
 }
 
 // Run resolves a working configuration, prompting where needed, and saves it.
@@ -79,6 +80,39 @@ func Run(ctx context.Context, opts Options) (*client.Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// Logout forgets this machine's credentials. It first tells the authorization
+// server to revoke the refresh token (RFC 7009), so the grant stops working
+// anywhere rather than just being deleted locally; a failure there is
+// reported but does not stop the local wipe, since an unreachable server
+// should not strand credentials on disk. The config file keeps the server URL
+// and roots so a later `login` only has to re-authenticate.
+func Logout(ctx context.Context) error {
+	path := client.DefaultConfigPath()
+	cfg, err := client.LoadConfig(path)
+	if err != nil {
+		return err
+	}
+	revoked := false
+	if cfg.OAuth != nil && cfg.OAuth.RefreshToken != "" {
+		if err := client.RevokeToken(ctx, cfg.URL, cfg.OAuth.RefreshToken); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not revoke the refresh token at the server: %v\n", err)
+		} else {
+			revoked = true
+		}
+	}
+	cfg.OAuth = nil
+	cfg.Token = ""
+	if err := cfg.Save(path); err != nil {
+		return err
+	}
+	if revoked {
+		fmt.Println("Revoked the refresh token and removed local credentials.")
+	} else {
+		fmt.Println("Removed local credentials.")
+	}
+	return nil
 }
 
 // needsURL reports whether the URL is still unset in any meaningful sense.
@@ -166,10 +200,19 @@ func authenticate(ctx context.Context, cfg *client.Config, opts Options) error {
 		cfg.OAuth = nil
 		return nil
 	}
-	// Already have something that works? Don't make the user re-authorize.
-	if cfg.AuthMode() != "none" {
+	// Already have something that works? Don't make the user re-authorize,
+	// unless they asked for fresh credentials.
+	if !opts.Force && cfg.AuthMode() != "none" {
 		if _, err := cfg.Verify(ctx); err == nil {
 			return nil
+		}
+	}
+	// Forcing a re-login rotates the grant: kill the old refresh token at the
+	// server so only the new one works. Best-effort — a dead server shouldn't
+	// block a fresh login.
+	if opts.Force && cfg.OAuth != nil && cfg.OAuth.RefreshToken != "" {
+		if err := client.RevokeToken(ctx, cfg.URL, cfg.OAuth.RefreshToken); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not revoke the old refresh token: %v\n", err)
 		}
 	}
 	// Does the server need credentials at all?
@@ -177,17 +220,16 @@ func authenticate(ctx context.Context, cfg *client.Config, opts Options) error {
 		return nil
 	}
 
-	port := opts.CallbackPort
-	if port <= 0 {
-		port = client.CallbackPort
-	}
-	// Prefer the brokered flow when the server offers it: it needs no local
-	// callback port, so it works identically over SSH, in a container, and on
-	// a headless machine. Fall back to the local-listener flow otherwise.
-	reg, regErr := client.FetchRegistration(ctx, cfg.URL)
-	_, discErr := client.Discover(ctx, cfg.URL)
-	if regErr == nil && reg.DeviceFlow {
-		tok, err := client.LoginDevice(ctx, cfg.URL, !opts.NoBrowser)
+	// The device grant is the only login flow: it needs no callback listener,
+	// no browser on this machine, and no client secret, so it works
+	// identically on a laptop, over SSH, in a container, and headless.
+	eps, discErr := client.Discover(ctx, cfg.URL)
+	if discErr == nil && eps.DeviceAuthorization != "" {
+		reg, regErr := client.FetchRegistration(ctx, cfg.URL)
+		if regErr != nil {
+			return fmt.Errorf("server publishes no collector registration; set LARD_COLLECTOR_CLIENT_ID there")
+		}
+		tok, err := client.LoginDevice(ctx, cfg.URL, reg.ClientID, reg.Scopes, !opts.NoBrowser)
 		if err != nil {
 			return err
 		}
@@ -195,26 +237,9 @@ func authenticate(ctx context.Context, cfg *client.Config, opts Options) error {
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
 			Expiry:       tok.Expiry,
-			CallbackPort: 0, // brokered: no local callback involved
+			ClientID:     reg.ClientID,
 		}
 		cfg.Token = ""
-		return nil
-	}
-	if discErr == nil {
-		tok, err := client.Login(ctx, cfg.URL, port, !opts.NoBrowser)
-		if err != nil {
-			return err
-		}
-		cfg.OAuth = &client.OAuthToken{
-			AccessToken:  tok.AccessToken,
-			RefreshToken: tok.RefreshToken,
-			Expiry:       tok.Expiry,
-			CallbackPort: port,
-		}
-		cfg.Token = ""
-		if tok.RefreshToken == "" {
-			fmt.Fprintln(os.Stderr, "note: no refresh token issued; you will need to log in again when this expires")
-		}
 		return nil
 	}
 

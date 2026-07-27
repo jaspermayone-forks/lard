@@ -35,7 +35,8 @@ consolidates itself once uploads go quiet.
 ## client
 
 ```
-lard-client login    [--url URL] [--token TOKEN] [--root DIR...]
+lard-client login    [--url URL] [--token TOKEN] [--root DIR...] [-f]
+lard-client logout                        # revoke + forget credentials
 lard-client status                        # server, auth, agent at a glance
 lard-client backfill [--root DIR...]      # every session ever, idempotent
 lard-client sync     [--workspace DIR...] # new sessions only
@@ -100,8 +101,7 @@ paths are `profile`, `areas/<name>`, `topics/<name>`, `people/<name>`.
 | `LARD_OAUTH_USERS` | | comma list of indiko `me` urls allowed to call lard |
 | `LARD_OAUTH_SCOPES` | | comma list of scopes every token must carry |
 | `LARD_COLLECTOR_CLIENT_ID` | | oauth client id collectors should use |
-| `LARD_COLLECTOR_CLIENT_SECRET` | | its secret; enables server-side code exchange |
-| `LARD_COLLECTOR_PORTS` | `40714-40718` | permitted localhost callback ports |
+| `LARD_COLLECTOR_SCOPES` | `profile` | scopes the collector should request |
 | `LARD_CONSOLIDATE_AFTER` | `5m` | quiet period before a pass; `off` to disable |
 | `LARD_CONSOLIDATE_MAX_WAIT` | `30m` | cap on that wait during constant uploads |
 | `HYPER_API_KEY` | | hyper API key for consolidation |
@@ -137,48 +137,36 @@ memory. lard warns at boot if you skip it.
 
 a collector cannot invent its own client id: the auth server decides which
 clients exist, and lard decides which it trusts, so a guessed id gets rejected.
-set `LARD_COLLECTOR_CLIENT_ID` and lard publishes it at `/auth/collector`, and
-`lard-client login` adopts it. that id is then trusted automatically, so it does
-not also need to be in `LARD_OAUTH_CLIENT_IDS`.
+set `LARD_COLLECTOR_CLIENT_ID` to a client id registered with your auth server
+and lard publishes it at `/auth/collector`; `lard-client login` adopts it. that
+id is then trusted automatically, so it does not also need to be in
+`LARD_OAUTH_CLIENT_IDS`.
 
-if you also set `LARD_COLLECTOR_CLIENT_SECRET`, lard performs the code exchange
-itself. the collector keeps its pkce verifier, the server keeps the secret, and
-neither can complete the exchange alone. that is what lets a pre-registered
-confidential client work from a laptop CLI without shipping the secret around.
+### login (device grant)
 
-### brokered login (device flow)
-
-with a collector client id and `LARD_PUBLIC_URL` set, lard brokers the whole
-authorization, following the shape of the oauth device grant ([rfc 8628]):
+the only login flow is the oauth device authorization grant ([rfc 8628]), run
+against the authorization server directly — lard is not involved beyond handing
+the collector its client id:
 
 ```
-POST /auth/collector/device        client starts, gets a code + url
-GET  /auth/collector/device/verify user opens this, gets sent to the provider
-GET  ...device/callback            provider redirects here; lard exchanges
-POST ...device/token               client polls until the token appears
+POST {as}/auth/device              client gets a device code + user code + url
+GET  {as}/device?code=XXXX-XXXX    user approves, from any browser anywhere
+POST {as}/auth/token               client polls until the token appears
 ```
 
-the redirect lands on lard, not on the collector, which is the whole point: a
-server url is reachable from whatever browser the user actually has. the
-collector needs no listener, no port forward, and no browser of its own.
+no listener, no port forward, and no browser on the collector's machine, so
+ssh, containers, and headless boxes all work the same way. no client secret
+either: the device code itself is the proof of possession, so the collector is
+an ordinary public client and there is nothing sensitive to ship.
 
-**register the callback with your provider.** lard logs the exact url at boot:
+requirements on the provider: it must serve rfc 8414 metadata advertising
+`device_authorization_endpoint` and support the device grant (indiko does).
+login fails with a clear message otherwise.
 
-```
-INFO register this redirect URI with your auth provider
-     redirect_uri=https://lard.your.domain/auth/collector/device/callback
-```
-
-that url is built from `LARD_PUBLIC_URL`, so set it to the server's external
-address before registering.
-
-pending sessions live in memory for 10 minutes, device codes are single use, and
-polling faster than once a second gets `slow_down`.
+with no collector registration configured (`LARD_COLLECTOR_CLIENT_ID` unset),
+`lard-client login` fails and tells you to set it.
 
 [rfc 8628]: https://datatracker.ietf.org/doc/html/rfc8628
-
-with no collector registration configured, `lard-client` falls back to a
-`http://localhost:<port>/` client id and tells you to allowlist it.
 
 ### indiko notes
 

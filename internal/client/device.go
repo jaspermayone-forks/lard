@@ -1,12 +1,13 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -14,7 +15,10 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Poll outcomes, matching RFC 8628's error codes.
+// deviceGrantType is the RFC 8628 section 3.4 grant used when polling.
+const deviceGrantType = "urn:ietf:params:oauth:grant-type:device_code"
+
+// Poll outcomes, matching RFC 8628 section 3.5's error codes.
 const (
 	errAuthorizationPending = "authorization_pending"
 	errSlowDown             = "slow_down"
@@ -22,25 +26,32 @@ const (
 	errAccessDenied         = "access_denied"
 )
 
-// DeviceAuth is what the server hands back when a brokered login starts.
-type DeviceAuth struct {
-	DeviceCode              string `json:"deviceCode"`
-	UserCode                string `json:"userCode"`
-	VerificationURI         string `json:"verificationUri"`
-	VerificationURIComplete string `json:"verificationUriComplete"`
-	ExpiresIn               int    `json:"expiresIn"`
-	Interval                int    `json:"interval"`
-}
-
-// LoginDevice authorizes this machine through the server rather than through a
-// local callback listener.
+// LoginDevice authorizes this machine with the OAuth device authorization
+// grant (RFC 8628), talking to the authorization server directly.
 //
-// The collector opens no ports and needs no browser of its own: the user visits
-// a URL on the lard server from any browser anywhere, and this function polls
-// until the server reports a token. That is what makes login work unchanged over
-// SSH, inside a container, and on a headless box.
-func LoginDevice(ctx context.Context, serverURL string, openBrowser bool) (*oauth2.Token, error) {
-	auth, err := startDevice(ctx, serverURL)
+// No listener, no browser, and no client secret are needed on this machine:
+// the device code itself is the proof of possession. The user approves the
+// user code at the AS's verification URI from any browser anywhere, which is
+// what makes login work unchanged over SSH, in a container, and on a headless
+// box.
+func LoginDevice(ctx context.Context, serverURL, clientID string, scopes []string, openBrowser bool) (*oauth2.Token, error) {
+	eps, err := Discover(ctx, serverURL)
+	if err != nil {
+		return nil, err
+	}
+	if eps.DeviceAuthorization == "" {
+		return nil, errors.New("the authorization server does not offer the device grant")
+	}
+	if clientID == "" {
+		if reg, err := FetchRegistration(ctx, serverURL); err == nil {
+			clientID = reg.ClientID
+		}
+	}
+	if clientID == "" {
+		return nil, errors.New("no client id: the server publishes no collector registration")
+	}
+
+	auth, err := startDevice(ctx, eps.DeviceAuthorization, clientID, scopes)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +59,7 @@ func LoginDevice(ctx context.Context, serverURL string, openBrowser bool) (*oaut
 
 	interval := time.Duration(auth.Interval) * time.Second
 	if interval <= 0 {
-		interval = 2 * time.Second
+		interval = 5 * time.Second // RFC 8628 §3.5 default
 	}
 	deadline := time.Now().Add(time.Duration(auth.ExpiresIn) * time.Second)
 	if auth.ExpiresIn <= 0 {
@@ -64,7 +75,7 @@ func LoginDevice(ctx context.Context, serverURL string, openBrowser bool) (*oaut
 		if time.Now().After(deadline) {
 			return nil, errors.New("this login expired; run 'lard-client login' again")
 		}
-		tok, code, err := pollDevice(ctx, serverURL, auth.DeviceCode)
+		tok, code, err := pollDevice(ctx, eps.Token, clientID, auth.DeviceCode)
 		if err != nil {
 			return nil, err
 		}
@@ -75,9 +86,9 @@ func LoginDevice(ctx context.Context, serverURL string, openBrowser bool) (*oaut
 		case errAuthorizationPending:
 			// Still waiting on the human.
 		case errSlowDown:
-			// The server says we are polling too fast; back off permanently
-			// rather than just for this round.
-			interval += time.Second
+			// RFC 8628 §3.5: increase the interval by 5 seconds for this and
+			// all subsequent requests.
+			interval += 5 * time.Second
 		case errExpiredToken:
 			return nil, errors.New("this login expired; run 'lard-client login' again")
 		case errAccessDenied:
@@ -86,6 +97,104 @@ func LoginDevice(ctx context.Context, serverURL string, openBrowser bool) (*oaut
 			return nil, fmt.Errorf("authorization failed: %s", code)
 		}
 	}
+}
+
+// DeviceAuth mirrors the RFC 8628 device authorization response.
+type DeviceAuth struct {
+	DeviceCode              string `json:"device_code"`
+	UserCode                string `json:"user_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete"`
+	ExpiresIn               int    `json:"expires_in"`
+	Interval                int    `json:"interval"`
+}
+
+// startDevice asks the authorization server for a device/user code pair.
+func startDevice(ctx context.Context, endpoint, clientID string, scopes []string) (*DeviceAuth, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	form := url.Values{"client_id": {clientID}}
+	if len(scopes) > 0 {
+		form.Set("scope", strings.Join(scopes, " "))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	req.Header.Set("accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("starting authorization: %w", err)
+	}
+	defer resp.Body.Close()
+	var auth DeviceAuth
+	if err := json.NewDecoder(resp.Body).Decode(&auth); err != nil {
+		return nil, fmt.Errorf("starting authorization: unreadable response (status %d)", resp.StatusCode)
+	}
+	if auth.DeviceCode == "" || auth.VerificationURI == "" {
+		return nil, fmt.Errorf("starting authorization: server returned status %d", resp.StatusCode)
+	}
+	return &auth, nil
+}
+
+// pollDevice asks the token endpoint once whether authorization finished. A
+// non-empty code string is an RFC 8628 status (pending, slow_down, ...)
+// rather than a transport failure.
+func pollDevice(ctx context.Context, tokenEndpoint, clientID, deviceCode string) (*oauth2.Token, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	form := url.Values{
+		"grant_type":  {deviceGrantType},
+		"device_code": {deviceCode},
+		"client_id":   {clientID},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint,
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	req.Header.Set("accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		// A transient network blip should not abandon a login the user is
+		// halfway through, so treat it as "keep waiting".
+		return nil, errAuthorizationPending, nil
+	}
+	defer resp.Body.Close()
+	var out struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		TokenType    string `json:"token_type"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Error        string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, "", fmt.Errorf("polling: unreadable response (status %d)", resp.StatusCode)
+	}
+	if out.Error != "" {
+		return nil, out.Error, nil
+	}
+	if out.AccessToken == "" {
+		return nil, "", fmt.Errorf("polling: server returned status %d", resp.StatusCode)
+	}
+	tok := &oauth2.Token{
+		AccessToken:  out.AccessToken,
+		RefreshToken: out.RefreshToken,
+		TokenType:    "Bearer",
+	}
+	if out.ExpiresIn > 0 {
+		tok.Expiry = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second)
+	}
+	return tok, "", nil
+}
+
+// isLocal guesses whether a browser on this machine is reachable by the user.
+// SSH sets these, and their absence is the common case on a laptop.
+func isLocal() bool {
+	return os.Getenv("SSH_CONNECTION") == "" && os.Getenv("SSH_CLIENT") == "" && os.Getenv("SSH_TTY") == ""
 }
 
 // printDevicePrompt shows the URL and code.
@@ -115,76 +224,4 @@ func printDevicePrompt(auth *DeviceAuth, openBrowser bool) {
 		fmt.Printf("Your code: %s\n", auth.UserCode)
 	}
 	fmt.Println("Waiting for you to authorize...")
-}
-
-func startDevice(ctx context.Context, serverURL string) (*DeviceAuth, error) {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(serverURL, "/")+"/auth/collector/device", strings.NewReader("{}"))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("content-type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("starting authorization: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, errors.New("this server does not offer brokered login")
-	}
-	var auth DeviceAuth
-	if err := json.NewDecoder(resp.Body).Decode(&auth); err != nil {
-		return nil, fmt.Errorf("starting authorization: unreadable response (status %d)", resp.StatusCode)
-	}
-	if auth.DeviceCode == "" || auth.VerificationURI == "" {
-		return nil, fmt.Errorf("starting authorization: server returned status %d", resp.StatusCode)
-	}
-	return &auth, nil
-}
-
-// pollDevice asks once whether authorization finished. A non-empty code string
-// is a status (pending, slow_down, ...) rather than a transport failure.
-func pollDevice(ctx context.Context, serverURL, deviceCode string) (*oauth2.Token, string, error) {
-	body, err := json.Marshal(map[string]string{"deviceCode": deviceCode})
-	if err != nil {
-		return nil, "", err
-	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(serverURL, "/")+"/auth/collector/device/token", bytes.NewReader(body))
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("content-type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		// A transient network blip should not abandon a login the user is
-		// halfway through, so treat it as "keep waiting".
-		return nil, errAuthorizationPending, nil
-	}
-	defer resp.Body.Close()
-	var out struct {
-		AccessToken  string    `json:"accessToken"`
-		RefreshToken string    `json:"refreshToken"`
-		Expiry       time.Time `json:"expiry"`
-		Error        string    `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, "", fmt.Errorf("polling: unreadable response (status %d)", resp.StatusCode)
-	}
-	if out.Error != "" {
-		return nil, out.Error, nil
-	}
-	if out.AccessToken == "" {
-		return nil, "", fmt.Errorf("polling: server returned status %d", resp.StatusCode)
-	}
-	return &oauth2.Token{
-		AccessToken:  out.AccessToken,
-		RefreshToken: out.RefreshToken,
-		Expiry:       out.Expiry,
-		TokenType:    "Bearer",
-	}, "", nil
 }

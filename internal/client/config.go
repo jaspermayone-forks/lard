@@ -36,9 +36,9 @@ type OAuthToken struct {
 	AccessToken  string    `json:"accessToken"`
 	RefreshToken string    `json:"refreshToken,omitempty"`
 	Expiry       time.Time `json:"expiry,omitempty"`
-	// CallbackPort pins the port the login used, since the OAuth client id is
-	// derived from it and a refresh must present the same id.
-	CallbackPort int `json:"callbackPort,omitempty"`
+	// ClientID is the public OAuth client this token was minted for. A refresh
+	// must present the same id, so it is pinned here rather than re-derived.
+	ClientID string `json:"clientId,omitempty"`
 }
 
 // expired reports whether the access token is gone or about to lapse. The
@@ -154,7 +154,7 @@ func (c *Config) Bearer(ctx context.Context, path string) (string, error) {
 		if !c.OAuth.expired() {
 			return c.OAuth.AccessToken, nil
 		}
-		tok, err := RefreshToken(ctx, c.URL, c.OAuth.RefreshToken, c.OAuth.CallbackPort)
+		tok, err := RefreshToken(ctx, c.URL, c.OAuth.RefreshToken, c.OAuth.ClientID)
 		if err != nil {
 			return "", err
 		}
