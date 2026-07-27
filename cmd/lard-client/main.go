@@ -22,6 +22,7 @@ import (
 	"github.com/taciturnaxolotl/lard/internal/dotenv"
 	"github.com/taciturnaxolotl/lard/internal/service"
 	"github.com/taciturnaxolotl/lard/internal/setup"
+	"github.com/taciturnaxolotl/lard/internal/ui"
 )
 
 // version is overridden at build time via -ldflags.
@@ -102,8 +103,8 @@ only has to re-authenticate.`,
 }
 
 func printConnected(cfg *client.Config) {
-	fmt.Printf("Connected to %s via %s.\n", cfg.URL, cfg.AuthMode())
-	fmt.Printf("Saved %s\n\nNext: lard-client backfill\n", client.DefaultConfigPath())
+	fmt.Println()
+	fmt.Printf("Connected to %s via %s.\n", ui.Link(cfg.URL, "lard-server"), cfg.AuthMode())
 }
 
 // --- collection ---

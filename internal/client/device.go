@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pkg/browser"
+	"github.com/taciturnaxolotl/lard/internal/ui"
 	"golang.org/x/oauth2"
 )
 
@@ -81,7 +82,6 @@ func LoginDevice(ctx context.Context, serverURL, clientID string, scopes []strin
 		}
 		switch code {
 		case "":
-			fmt.Println("Connected.")
 			return tok, nil
 		case errAuthorizationPending:
 			// Still waiting on the human.
@@ -129,6 +129,9 @@ func startDevice(ctx context.Context, endpoint, clientID string, scopes []string
 		return nil, fmt.Errorf("starting authorization: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return nil, errors.New("authorization server is rate-limited; wait a moment and try again")
+	}
 	var auth DeviceAuth
 	if err := json.NewDecoder(resp.Body).Decode(&auth); err != nil {
 		return nil, fmt.Errorf("starting authorization: unreadable response (status %d)", resp.StatusCode)
@@ -212,16 +215,16 @@ func printDevicePrompt(auth *DeviceAuth, openBrowser bool) {
 		opened = browser.OpenURL(target) == nil
 	}
 	if opened {
-		fmt.Println("Opened your browser to authorize. If it opened on the wrong")
-		fmt.Println("machine, use this URL from any browser instead:")
+		fmt.Println("Opened your browser to authorize.")
+		fmt.Println("If it opened on the wrong machine, use this link instead:")
 	} else {
-		fmt.Println("Open this URL in any browser to authorize:")
+		fmt.Println("Open this link in any browser to authorize:")
 	}
-	// Bare and unstyled on its own line: terminals linkify a lone URL, and
-	// decoration breaks copy and paste.
-	fmt.Printf("\n%s\n\n", target)
+	fmt.Println()
+	fmt.Println(ui.Link(target, "lard-device"))
+	fmt.Println()
 	if auth.UserCode != "" {
-		fmt.Printf("Your code: %s\n", auth.UserCode)
+		fmt.Printf("Your code: %s\n", ui.Success(auth.UserCode))
 	}
-	fmt.Println("Waiting for you to authorize...")
+	fmt.Println(ui.Subtle("Waiting for you to authorize..."))
 }

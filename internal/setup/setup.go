@@ -18,6 +18,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/taciturnaxolotl/lard/internal/client"
+	"github.com/taciturnaxolotl/lard/internal/ui"
 )
 
 // Interactive reports whether we can prompt: a TTY on both ends, and no CI
@@ -110,7 +111,7 @@ func Logout(ctx context.Context) error {
 	if revoked {
 		fmt.Println("Revoked the refresh token and removed local credentials.")
 	} else {
-		fmt.Println("Removed local credentials.")
+		fmt.Println(ui.Subtle("Removed local credentials."))
 	}
 	return nil
 }
