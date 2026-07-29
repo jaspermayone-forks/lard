@@ -22,24 +22,24 @@ type Server struct {
 	Consolidate Consolidate `toml:"consolidate"`
 }
 
-// LLM holds OpenAI-compatible client settings.
+// LLM holds the consolidation model's settings. Any OpenAI-compatible
+// endpoint works; Hyper (hyper.charm.land) is the default.
 type LLM struct {
-	BaseURL    string `toml:"base_url" env:"OPENAI_BASE_URL"`
-	Model      string `toml:"model" env:"OPENAI_MODEL"`
-	APIKey     string `toml:"api_key" env:"OPENAI_API_KEY"`
+	BaseURL    string `toml:"base_url" env:"LARD_HYPER_BASE_URL"`
+	Model      string `toml:"model" env:"LARD_MODEL"`
+	APIKey     string `toml:"api_key" env:"LARD_HYPER_API_KEY"`
 	APIVersion string `toml:"api_version" env:"OPENAI_API_VERSION"`
 }
 
 // Auth holds authentication configuration.
 type Auth struct {
-	Mode              string   `toml:"mode" env:"LARD_AUTH" default:"none"`
-	Token             string   `toml:"token" env:"LARD_TOKEN"`
-	IndikoURL         string   `toml:"indiko_url" env:"LARD_INDIKO_URL" default:"https://indiko.dunkirk.sh"`
-	PublicURL         string   `toml:"public_url" env:"LARD_PUBLIC_URL"`
-	AllowedClientIDs  []string `toml:"allowed_client_ids" env:"LARD_OAUTH_CLIENT_IDS"`
-	AllowedUsers      []string `toml:"allowed_users" env:"LARD_OAUTH_USERS"`
-	RequiredScopes    []string `toml:"required_scopes" env:"LARD_OAUTH_SCOPES"`
-	CollectorClientID string   `toml:"collector_client_id" env:"LARD_COLLECTOR_CLIENT_ID"`
+	Mode             string   `toml:"mode" env:"LARD_AUTH" default:"none"`
+	Token            string   `toml:"token" env:"LARD_TOKEN"`
+	AuthServerURL    string   `toml:"auth_server" env:"LARD_AUTH_SERVER"`
+	PublicURL        string   `toml:"public_url" env:"LARD_PUBLIC_URL"`
+	AllowedClientIDs []string `toml:"allowed_client_ids" env:"LARD_OAUTH_CLIENT_IDS"`
+	AllowedUsers     []string `toml:"allowed_users" env:"LARD_OAUTH_USERS"`
+	RequiredScopes   []string `toml:"required_scopes" env:"LARD_OAUTH_SCOPES"`
 }
 
 // Collector holds the collector OAuth registration.

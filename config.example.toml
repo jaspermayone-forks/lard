@@ -1,35 +1,35 @@
 # Lard server configuration
-# Copy this to ~/.config/lard/config.toml and edit as needed
+# Copy this to ~/.config/lard/config.toml and edit as needed.
+# Env vars always win over this file.
 
 # Server settings
 addr = ":7477"
-db = ""  # defaults to ~/.config/lard/lard.db
+db = ""          # defaults to ~/.config/lard/lard.db
 memory_dir = ""  # defaults to ~/.config/lard/memory
 
-# LLM client (for /consolidate endpoint)
+# Consolidation model (any OpenAI-compatible endpoint; Hyper is the default)
 [llm]
-base_url = "https://api.openai.com/v1"
-model = "gpt-4o-mini"
-api_key = ""  # or set OPENAI_API_KEY env var
+base_url = ""    # defaults to https://hyper.charm.land
+model = ""       # defaults to deepseek-v4-flash
+api_key = ""     # or set LARD_HYPER_API_KEY / HYPER_API_KEY
 api_version = ""
 
 # Authentication
 [auth]
-mode = "none"  # none, token, or bearer
-token = ""  # static token for token mode
-indiko_url = "https://indiko.dunkirk.sh"
-public_url = ""  # your public URL for OAuth redirects
+mode = "none"          # none, token, or oauth
+token = ""             # shared secret for token mode
+auth_server = ""       # authorization server URL for oauth mode
+public_url = ""        # lard's external URL; goes in the OAuth metadata
 allowed_client_ids = []  # OAuth client IDs allowed to access
-allowed_users = []  # user emails/IDs allowed to access
-required_scopes = []  # required OAuth scopes
-collector_client_id = ""  # collector's OAuth client ID
+allowed_users = []       # user identity URLs allowed to access
+required_scopes = []     # scopes every token must carry
 
 # Collector registration (published to edge collectors)
 [collector]
-client_id = ""  # the OAuth client ID collectors should use
-scopes = ["read", "write"]  # scopes granted to collectors
+client_id = ""            # the OAuth client ID collectors should use
+scopes = ["profile"]      # scopes the collector should request
 
 # Auto-consolidation (runs when uploads go quiet)
 [consolidate]
-after = "5m"  # wait this long after last upload before consolidating
-max_wait = "30m"  # but consolidate at least this often
+after = "5m"     # wait this long after last upload before consolidating
+max_wait = "30m" # but consolidate at least this often

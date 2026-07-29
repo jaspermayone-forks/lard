@@ -1,16 +1,17 @@
 // Package auth gates lard's HTTP and MCP surfaces. Two modes:
 //
-//   - bearer: lard is an OAuth 2.1 protected resource. Access tokens are
-//     validated against indiko's introspection endpoint (RFC 7662), and lard
-//     publishes protected-resource metadata (RFC 9728) so MCP clients can
-//     discover indiko as the authorization server.
+//   - oauth: lard is an OAuth 2.1 protected resource. Access tokens are
+//     validated against the authorization server's introspection endpoint
+//     (RFC 7662), and lard publishes protected-resource metadata (RFC 9728)
+//     so MCP clients can discover the authorization server.
 //   - token: a single shared secret (LARD_TOKEN) for the collector path when
 //     the full OAuth dance is overkill (e.g. a homelab cron).
 //
-// Indiko issues tokens for every app the user authorizes, so lard must check
-// that a token was actually minted for lard. Without that check any app the
-// user has ever signed into could read their whole memory (the "confused
-// deputy" problem). Set an audience or user allowlist to close it.
+// The authorization server issues tokens for every app the user authorizes,
+// so lard must check that a token was actually minted for lard. Without that
+// check any app the user has ever signed into could read their whole memory
+// (the "confused deputy" problem). Set an audience or user allowlist to
+// close it.
 package auth
 
 import (
@@ -33,13 +34,13 @@ import (
 type Mode string
 
 const (
-	ModeNone   Mode = "none"
-	ModeBearer Mode = "bearer" // indiko OAuth
-	ModeToken  Mode = "token"  // shared secret
+	ModeNone  Mode = "none"
+	ModeOAuth Mode = "oauth" // OAuth 2.1 protected resource
+	ModeToken Mode = "token" // shared secret
 )
 
 // Discovery paths lard serves. The authorization-server path exists only to
-// point 2025-03-26-era MCP clients at indiko; newer clients use the
+// point 2025-03-26-era MCP clients at the authorization server; newer clients
 // protected-resource document.
 const (
 	PathProtectedResource = "/.well-known/oauth-protected-resource"
@@ -54,18 +55,18 @@ type Config struct {
 	Mode Mode
 	// Token is the shared secret for ModeToken.
 	Token string
-	// IndikoURL is the indiko base URL (https://indiko.dunkirk.sh) for ModeBearer.
-	IndikoURL string
+	// AuthServerURL is the authorization server's base URL for ModeOAuth.
+	AuthServerURL string
 	// PublicURL is lard's own externally reachable base URL. It is the
 	// resource identifier in the protected-resource metadata, so clients know
-	// which resource they are asking indiko for a token for.
+	// which resource they are asking the authorization server for a token for.
 	PublicURL string
 	// AllowedClientIDs limits which OAuth clients may call lard, matched
 	// against the client_id on the introspected token. Empty means any client
 	// the user has authorized is accepted.
 	AllowedClientIDs []string
-	// AllowedUsers limits which indiko identities may call lard, matched
-	// against the token's "me" URL. Empty means any user is accepted.
+	// AllowedUsers limits which identities may call lard, matched against
+	// the token's "me" URL. Empty means any user is accepted.
 	AllowedUsers []string
 	// RequiredScopes are scopes every token must carry. Empty means none.
 	RequiredScopes []string
@@ -90,21 +91,21 @@ func (c Config) clientAllowlist() []string {
 	return append(append([]string{}, c.AllowedClientIDs...), c.CollectorClientID)
 }
 
-// Validate reports configuration problems worth logging at boot. Bearer mode
+// Validate reports configuration problems worth logging at boot. OAuth mode
 // with no allowlist works, but it trusts every app the user has authorized.
 func (c Config) Validate() []string {
 	var warns []string
-	if c.Mode != ModeBearer {
+	if c.Mode != ModeOAuth {
 		return nil
 	}
-	if c.IndikoURL == "" {
-		warns = append(warns, "bearer auth has no indiko URL; every request will be rejected")
+	if c.AuthServerURL == "" {
+		warns = append(warns, "oauth auth has no authorization server URL; every request will be rejected")
 	}
 	if c.PublicURL == "" {
-		warns = append(warns, "bearer auth has no LARD_PUBLIC_URL; OAuth discovery metadata will be incomplete")
+		warns = append(warns, "oauth auth has no public_url; OAuth discovery metadata will be incomplete")
 	}
 	if len(c.clientAllowlist()) == 0 && len(c.AllowedUsers) == 0 {
-		warns = append(warns, "bearer auth has no audience restriction: any app the user authorized with indiko can read all memory (set LARD_OAUTH_CLIENT_IDS or LARD_OAUTH_USERS)")
+		warns = append(warns, "oauth auth has no audience restriction: any app the user authorized with the same provider can read all memory (set allowed_client_ids or allowed_users)")
 	}
 	return warns
 }
@@ -112,7 +113,7 @@ func (c Config) Validate() []string {
 // Identity is who the caller turned out to be. It rides on the request
 // context so handlers can attribute writes later.
 type Identity struct {
-	Subject  string // indiko "me" URL
+	Subject  string // authorization server "me" URL
 	ClientID string
 	Scopes   []string
 }
@@ -147,7 +148,7 @@ func Middleware(cfg Config, next http.Handler) http.Handler {
 				return
 			}
 			next.ServeHTTP(w, r)
-		case ModeBearer:
+		case ModeOAuth:
 			id, status, code, desc := v.authorize(r)
 			if status != 0 {
 				writeChallenge(w, r, cfg, status, code, desc)
@@ -162,7 +163,7 @@ func Middleware(cfg Config, next http.Handler) http.Handler {
 
 // writeChallenge emits an RFC 6750 challenge. The resource_metadata parameter
 // (RFC 9728) is what lets an MCP client bootstrap the OAuth flow from a bare
-// 401, without knowing anything about indiko up front. It names the metadata
+// 401, without knowing anything about the authorization server up front. It names the metadata
 // document for the exact path being refused, so a client hitting /mcp is sent
 // to the /mcp-suffixed document.
 func writeChallenge(w http.ResponseWriter, r *http.Request, cfg Config, status int, code, desc string) {
@@ -236,14 +237,14 @@ func (i introspection) subject() string {
 	return i.Subject
 }
 
-// authorize validates the bearer token and the claims on it. A zero status
+// authorize validates the access token and the claims on it. A zero status
 // means the request may proceed; otherwise status/code/desc describe the
 // refusal (401 for a bad token, 403 for a token that is valid but not for us).
 func (v *verifier) authorize(r *http.Request) (id Identity, status int, code, desc string) {
 	header := r.Header.Get("Authorization")
 	tok := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 	if tok == "" || tok == header {
-		return id, http.StatusUnauthorized, "invalid_request", "missing bearer token"
+		return id, http.StatusUnauthorized, "invalid_request", "missing access token"
 	}
 	res, ok := v.introspectCached(r.Context(), tok)
 	if !ok || !res.Active {
@@ -274,7 +275,7 @@ func (v *verifier) authorize(r *http.Request) (id Identity, status int, code, de
 
 // allowed reports whether v is in the list, treating an empty list as
 // unrestricted. Client IDs and identity URLs are compared with trailing
-// slashes normalized away, since indiko and clients disagree about them.
+// slashes normalized away, since providers and clients disagree about them.
 func allowed(list []string, v string) bool {
 	if len(list) == 0 {
 		return true
@@ -294,7 +295,7 @@ func hasScope(scopes []string, want string) bool {
 
 // introspectCached memoizes introspection results, keyed by a token digest so
 // the raw secret is not a map key. Negative results are cached briefly too, so
-// a client retrying with a dead token cannot hammer indiko.
+// a client retrying with a dead token cannot hammer the provider.
 func (v *verifier) introspectCached(ctx context.Context, tok string) (introspection, bool) {
 	sum := sha256.Sum256([]byte(tok))
 	key := hex.EncodeToString(sum[:])
@@ -326,16 +327,17 @@ func (v *verifier) introspectCached(ctx context.Context, tok string) (introspect
 	return res, true
 }
 
-// introspect asks indiko whether the token is live. Fail closed.
+// introspect asks the authorization server whether the token is live. Fail
+// closed.
 func (v *verifier) introspect(ctx context.Context, tok string) (introspection, bool) {
-	if v.cfg.IndikoURL == "" {
+	if v.cfg.AuthServerURL == "" {
 		return introspection{}, false
 	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	form := url.Values{"token": {tok}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(v.cfg.IndikoURL, "/")+"/auth/token/introspect",
+		strings.TrimRight(v.cfg.AuthServerURL, "/")+"/auth/token/introspect",
 		strings.NewReader(form.Encode()))
 	if err != nil {
 		return introspection{}, false
@@ -361,7 +363,7 @@ func (v *verifier) introspect(ctx context.Context, tok string) (introspection, b
 }
 
 // ProtectedResourceMetadata serves the RFC 9728 document describing lard as a
-// protected resource and indiko as its authorization server. This is the
+// protected resource and naming its authorization server. This is the
 // discovery entry point for MCP clients: they read it after a 401 and know
 // where to send the user.
 //
@@ -373,7 +375,7 @@ func (v *verifier) introspect(ctx context.Context, tok string) (introspection, b
 // whichever resource was requested.
 func ProtectedResourceMetadata(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.Mode != ModeBearer || cfg.IndikoURL == "" {
+		if cfg.Mode != ModeOAuth || cfg.AuthServerURL == "" {
 			http.NotFound(w, r)
 			return
 		}
@@ -384,7 +386,7 @@ func ProtectedResourceMetadata(cfg Config) http.HandlerFunc {
 		suffix := strings.TrimPrefix(r.URL.Path, PathProtectedResource)
 		doc := map[string]any{
 			"resource":                 base + suffix,
-			"authorization_servers":    []string{strings.TrimRight(cfg.IndikoURL, "/")},
+			"authorization_servers":    []string{strings.TrimRight(cfg.AuthServerURL, "/")},
 			"bearer_methods_supported": []string{"header"},
 			"resource_documentation":   "https://github.com/taciturnaxolotl/lard",
 		}
@@ -397,17 +399,18 @@ func ProtectedResourceMetadata(cfg Config) http.HandlerFunc {
 	}
 }
 
-// AuthServerMetadata redirects to indiko's authorization-server metadata.
+// AuthServerMetadata redirects to the authorization server's metadata.
 // Proxying the body would be simpler but breaks clients: RFC 8414 makes them
 // check that the issuer in the document matches where they fetched it from,
-// and indiko's issuer is indiko, not lard. A redirect keeps that invariant.
+// and the AS's issuer is its own origin, not lard. A redirect keeps that
+// invariant.
 func AuthServerMetadata(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.Mode != ModeBearer || cfg.IndikoURL == "" {
+		if cfg.Mode != ModeOAuth || cfg.AuthServerURL == "" {
 			http.NotFound(w, r)
 			return
 		}
-		http.Redirect(w, r, strings.TrimRight(cfg.IndikoURL, "/")+PathAuthServer, http.StatusFound)
+		http.Redirect(w, r, strings.TrimRight(cfg.AuthServerURL, "/")+PathAuthServer, http.StatusFound)
 	}
 }
 

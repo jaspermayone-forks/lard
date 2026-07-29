@@ -70,7 +70,7 @@ func run() error {
 	// The LLM client is optional at boot: the API works without it, only
 	// /consolidate refuses.
 	var llmClient *llm.Client
-	if c, err := llm.NewFromEnv(ctx); err != nil {
+	if c, err := llm.New(ctx, cfg.LLM); err != nil {
 		slog.Warn("no LLM client; /consolidate disabled", "reason", err)
 	} else {
 		llmClient = c
@@ -88,12 +88,12 @@ func run() error {
 	authCfg := auth.Config{
 		Mode:              auth.Mode(cfg.Auth.Mode),
 		Token:             cfg.Auth.Token,
-		IndikoURL:         cfg.Auth.IndikoURL,
+		AuthServerURL:     cfg.Auth.AuthServerURL,
 		PublicURL:         cfg.Auth.PublicURL,
 		AllowedClientIDs:  cfg.Auth.AllowedClientIDs,
 		AllowedUsers:      cfg.Auth.AllowedUsers,
 		RequiredScopes:    cfg.Auth.RequiredScopes,
-		CollectorClientID: cfg.Auth.CollectorClientID,
+		CollectorClientID: cfg.Collector.ClientID,
 	}
 
 	// The collector registration: which OAuth client edge collectors adopt.

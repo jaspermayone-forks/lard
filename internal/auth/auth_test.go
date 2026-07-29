@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-// fakeIndiko stands in for indiko's introspection endpoint.
-func fakeIndiko(t *testing.T, res map[string]any) *httptest.Server {
+// fakeAuthServer stands in for the authorization server's introspection endpoint.
+func fakeAuthServer(t *testing.T, res map[string]any) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/auth/token/introspect" {
@@ -30,11 +30,11 @@ func fakeIndiko(t *testing.T, res map[string]any) *httptest.Server {
 	return srv
 }
 
-func bearerConfig(indiko string) Config {
+func oauthConfig(authServer string) Config {
 	return Config{
-		Mode:      ModeBearer,
-		IndikoURL: indiko,
-		PublicURL: "https://lard.example.com",
+		Mode:          ModeOAuth,
+		AuthServerURL: authServer,
+		PublicURL:     "https://lard.example.com",
 	}
 }
 
@@ -58,24 +58,24 @@ func okHandler() http.Handler {
 	})
 }
 
-func TestBearerAcceptsActiveToken(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/kieran",
+func TestOAuthAcceptsActiveToken(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "https://app.example.com", "scope": "profile email",
 	})
-	h := Middleware(bearerConfig(srv.URL), okHandler())
+	h := Middleware(oauthConfig(srv.URL), okHandler())
 	w := do(h, "Bearer good")
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", w.Code)
 	}
-	if got := w.Header().Get("X-Subject"); got != "https://indiko.example.com/u/kieran" {
+	if got := w.Header().Get("X-Subject"); got != "https://auth.example.com/u/kieran" {
 		t.Errorf("identity not propagated: %q", got)
 	}
 }
 
-func TestBearerRejectsInactiveToken(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{"active": true})
-	h := Middleware(bearerConfig(srv.URL), okHandler())
+func TestOAuthRejectsInactiveToken(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{"active": true})
+	h := Middleware(oauthConfig(srv.URL), okHandler())
 	w := do(h, "Bearer nope")
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", w.Code)
@@ -87,22 +87,23 @@ func TestBearerRejectsInactiveToken(t *testing.T) {
 	}
 }
 
-func TestBearerRejectsMissingHeader(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{"active": true})
-	h := Middleware(bearerConfig(srv.URL), okHandler())
+func TestOAuthRejectsMissingHeader(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{"active": true})
+	h := Middleware(oauthConfig(srv.URL), okHandler())
 	if w := do(h, ""); w.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", w.Code)
 	}
 }
 
 // A token minted for a different app must not open lard. This is the confused
-// deputy case: indiko happily issues tokens for every app the user authorizes.
-func TestBearerRejectsForeignClient(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/kieran",
+// deputy case: the provider happily issues tokens for every app the user
+// authorizes.
+func TestOAuthRejectsForeignClient(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "https://someone-elses-app.example.com", "scope": "profile",
 	})
-	cfg := bearerConfig(srv.URL)
+	cfg := oauthConfig(srv.URL)
 	cfg.AllowedClientIDs = []string{"https://lard.example.com/"}
 	h := Middleware(cfg, okHandler())
 	w := do(h, "Bearer good")
@@ -111,12 +112,12 @@ func TestBearerRejectsForeignClient(t *testing.T) {
 	}
 }
 
-func TestBearerAllowsListedClientIgnoringTrailingSlash(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/kieran",
+func TestOAuthAllowsListedClientIgnoringTrailingSlash(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "https://lard.example.com", "scope": "profile",
 	})
-	cfg := bearerConfig(srv.URL)
+	cfg := oauthConfig(srv.URL)
 	cfg.AllowedClientIDs = []string{"https://lard.example.com/"}
 	h := Middleware(cfg, okHandler())
 	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
@@ -124,25 +125,25 @@ func TestBearerAllowsListedClientIgnoringTrailingSlash(t *testing.T) {
 	}
 }
 
-func TestBearerRejectsUnlistedUser(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/stranger",
+func TestOAuthRejectsUnlistedUser(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/stranger",
 		"client_id": "https://lard.example.com", "scope": "profile",
 	})
-	cfg := bearerConfig(srv.URL)
-	cfg.AllowedUsers = []string{"https://indiko.example.com/u/kieran"}
+	cfg := oauthConfig(srv.URL)
+	cfg.AllowedUsers = []string{"https://auth.example.com/u/kieran"}
 	h := Middleware(cfg, okHandler())
 	if w := do(h, "Bearer good"); w.Code != http.StatusForbidden {
 		t.Fatalf("want 403, got %d", w.Code)
 	}
 }
 
-func TestBearerRejectsInsufficientScope(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/kieran",
+func TestOAuthRejectsInsufficientScope(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "https://lard.example.com", "scope": "profile",
 	})
-	cfg := bearerConfig(srv.URL)
+	cfg := oauthConfig(srv.URL)
 	cfg.RequiredScopes = []string{"email"}
 	h := Middleware(cfg, okHandler())
 	w := do(h, "Bearer good")
@@ -156,8 +157,8 @@ func TestBearerRejectsInsufficientScope(t *testing.T) {
 
 // Discovery must work unauthenticated, otherwise a client cannot bootstrap.
 func TestDiscoveryIsUnauthenticated(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{"active": true})
-	cfg := bearerConfig(srv.URL)
+	srv := fakeAuthServer(t, map[string]any{"active": true})
+	cfg := oauthConfig(srv.URL)
 	mux := http.NewServeMux()
 	mux.Handle(PathProtectedResource, ProtectedResourceMetadata(cfg))
 	mux.Handle(PathProtectedResource+"/", ProtectedResourceMetadata(cfg))
@@ -199,10 +200,10 @@ func TestDiscoveryIsUnauthenticated(t *testing.T) {
 }
 
 // A 401 on /mcp must name the /mcp metadata document, not the base one, or the
-// client will ask indiko for a token scoped to the wrong resource.
+// client will ask the provider for a token scoped to the wrong resource.
 func TestChallengeOnMCPNamesMCPResource(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{"active": true})
-	h := Middleware(bearerConfig(srv.URL), okHandler())
+	srv := fakeAuthServer(t, map[string]any{"active": true})
+	h := Middleware(oauthConfig(srv.URL), okHandler())
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/mcp", nil))
 	if w.Code != http.StatusUnauthorized {
@@ -217,19 +218,19 @@ func TestChallengeOnMCPNamesMCPResource(t *testing.T) {
 // Redirecting instead of proxying keeps the issuer consistent with the URL the
 // client fetched, which RFC 8414 requires clients to verify.
 func TestAuthServerMetadataRedirects(t *testing.T) {
-	cfg := bearerConfig("https://indiko.example.com")
+	cfg := oauthConfig("https://auth.example.com")
 	w := httptest.NewRecorder()
 	AuthServerMetadata(cfg)(w, httptest.NewRequest(http.MethodGet, PathAuthServer, nil))
 	if w.Code != http.StatusFound {
 		t.Fatalf("want 302, got %d", w.Code)
 	}
-	want := "https://indiko.example.com" + PathAuthServer
+	want := "https://auth.example.com" + PathAuthServer
 	if got := w.Header().Get("Location"); got != want {
 		t.Errorf("Location = %q, want %q", got, want)
 	}
 }
 
-func TestDiscoveryHiddenWhenNotBearerMode(t *testing.T) {
+func TestDiscoveryHiddenWhenNotOAuthMode(t *testing.T) {
 	cfg := Config{Mode: ModeNone}
 	w := httptest.NewRecorder()
 	ProtectedResourceMetadata(cfg)(w, httptest.NewRequest(http.MethodGet, PathProtectedResource, nil))
@@ -260,8 +261,8 @@ func TestSharedSecretModeRejectsEmptyConfig(t *testing.T) {
 }
 
 // Introspection failures must fail closed, not open.
-func TestBearerFailsClosedWhenIndikoUnreachable(t *testing.T) {
-	cfg := bearerConfig("http://127.0.0.1:1")
+func TestOAuthFailsClosedWhenProviderUnreachable(t *testing.T) {
+	cfg := oauthConfig("http://127.0.0.1:1")
 	h := Middleware(cfg, okHandler())
 	if w := do(h, "Bearer good"); w.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", w.Code)
@@ -269,11 +270,11 @@ func TestBearerFailsClosedWhenIndikoUnreachable(t *testing.T) {
 }
 
 func TestValidateWarnsAboutMissingAudience(t *testing.T) {
-	warns := Config{Mode: ModeBearer, IndikoURL: "https://i", PublicURL: "https://l"}.Validate()
+	warns := Config{Mode: ModeOAuth, AuthServerURL: "https://i", PublicURL: "https://l"}.Validate()
 	if len(warns) != 1 || !strings.Contains(warns[0], "audience") {
 		t.Fatalf("want audience warning, got %v", warns)
 	}
-	cfg := Config{Mode: ModeBearer, IndikoURL: "https://i", PublicURL: "https://l", AllowedUsers: []string{"me"}}
+	cfg := Config{Mode: ModeOAuth, AuthServerURL: "https://i", PublicURL: "https://l", AllowedUsers: []string{"me"}}
 	if warns := cfg.Validate(); len(warns) != 0 {
 		t.Fatalf("want no warnings, got %v", warns)
 	}
@@ -292,11 +293,11 @@ func TestHealthzBypassesAuth(t *testing.T) {
 // operator also repeating it in the allowlist. Publishing an identity and then
 // rejecting it is the failure this guards.
 func TestCollectorClientIDIsTrustedImplicitly(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/kieran",
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "ikc_collector", "scope": "profile",
 	})
-	cfg := bearerConfig(srv.URL)
+	cfg := oauthConfig(srv.URL)
 	cfg.CollectorClientID = "ikc_collector"
 	h := Middleware(cfg, okHandler())
 	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
@@ -307,11 +308,11 @@ func TestCollectorClientIDIsTrustedImplicitly(t *testing.T) {
 // An explicit collector id is itself a restriction, so it must not widen access
 // to every client the user has ever authorized.
 func TestCollectorClientIDNarrowsWhenNoOtherAllowlist(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/kieran",
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "https://some-other-app.example.com/", "scope": "profile",
 	})
-	cfg := bearerConfig(srv.URL)
+	cfg := oauthConfig(srv.URL)
 	cfg.CollectorClientID = "ikc_collector"
 	h := Middleware(cfg, okHandler())
 	if w := do(h, "Bearer good"); w.Code != http.StatusForbidden {
@@ -320,11 +321,11 @@ func TestCollectorClientIDNarrowsWhenNoOtherAllowlist(t *testing.T) {
 }
 
 func TestCollectorClientIDAddsToExistingAllowlist(t *testing.T) {
-	srv := fakeIndiko(t, map[string]any{
-		"active": true, "me": "https://indiko.example.com/u/kieran",
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "ikc_mcp", "scope": "profile",
 	})
-	cfg := bearerConfig(srv.URL)
+	cfg := oauthConfig(srv.URL)
 	cfg.AllowedClientIDs = []string{"ikc_mcp"}
 	cfg.CollectorClientID = "ikc_collector"
 	h := Middleware(cfg, okHandler())
@@ -336,7 +337,7 @@ func TestCollectorClientIDAddsToExistingAllowlist(t *testing.T) {
 // Setting only a collector id counts as an audience restriction, so the
 // "anyone can read your memory" warning must not fire.
 func TestValidateAcceptsCollectorIDAsAudience(t *testing.T) {
-	cfg := Config{Mode: ModeBearer, IndikoURL: "https://i", PublicURL: "https://l", CollectorClientID: "ikc_x"}
+	cfg := Config{Mode: ModeOAuth, AuthServerURL: "https://i", PublicURL: "https://l", CollectorClientID: "ikc_x"}
 	if warns := cfg.Validate(); len(warns) != 0 {
 		t.Fatalf("want no warnings, got %v", warns)
 	}

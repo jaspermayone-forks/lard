@@ -22,13 +22,12 @@ model = "gpt-4"
 api_key = "sk-test123"
 
 [auth]
-mode = "bearer"
-indiko_url = "https://indiko.example.com"
+mode = "oauth"
+auth_server = "https://auth.example.com"
 public_url = "https://lard.example.com"
 allowed_client_ids = ["client1", "client2"]
 allowed_users = ["user@example.com"]
 required_scopes = ["profile", "email"]
-collector_client_id = "collector-abc"
 
 [collector]
 client_id = "collector-abc"
@@ -56,8 +55,8 @@ max_wait = "1h"
 	if cfg.LLM.Model != "gpt-4" {
 		t.Errorf("expected model gpt-4, got %s", cfg.LLM.Model)
 	}
-	if cfg.Auth.Mode != "bearer" {
-		t.Errorf("expected mode bearer, got %s", cfg.Auth.Mode)
+	if cfg.Auth.Mode != "oauth" {
+		t.Errorf("expected mode oauth, got %s", cfg.Auth.Mode)
 	}
 	if len(cfg.Auth.AllowedClientIDs) != 2 {
 		t.Errorf("expected 2 allowed client IDs, got %d", len(cfg.Auth.AllowedClientIDs))
@@ -95,8 +94,8 @@ func TestDefaults(t *testing.T) {
 	if cfg.Auth.Mode != "none" {
 		t.Errorf("expected default auth mode none, got %s", cfg.Auth.Mode)
 	}
-	if cfg.Auth.IndikoURL != "https://indiko.dunkirk.sh" {
-		t.Errorf("expected default indiko URL, got %s", cfg.Auth.IndikoURL)
+	if cfg.Auth.AuthServerURL != "" {
+		t.Errorf("expected empty auth server URL default, got %s", cfg.Auth.AuthServerURL)
 	}
 }
 
@@ -134,8 +133,8 @@ func TestSplitList(t *testing.T) {
 func clearLARDEnv() {
 	envVars := []string{
 		"LARD_ADDR", "LARD_DB", "LARD_MEMORY_DIR",
-		"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY", "OPENAI_API_VERSION",
-		"LARD_AUTH", "LARD_TOKEN", "LARD_INDIKO_URL", "LARD_PUBLIC_URL",
+		"LARD_HYPER_BASE_URL", "LARD_MODEL", "LARD_HYPER_API_KEY", "OPENAI_API_VERSION",
+		"LARD_AUTH", "LARD_TOKEN", "LARD_AUTH_SERVER", "LARD_PUBLIC_URL",
 		"LARD_OAUTH_CLIENT_IDS", "LARD_OAUTH_USERS", "LARD_OAUTH_SCOPES",
 		"LARD_COLLECTOR_CLIENT_ID", "LARD_COLLECTOR_SCOPES",
 		"LARD_CONSOLIDATE_AFTER", "LARD_CONSOLIDATE_MAX_WAIT",

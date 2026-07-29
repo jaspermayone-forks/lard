@@ -1,5 +1,5 @@
-// Package llm is the consolidator's model client, built on fantasy with
-// Hyper (hyper.charm.land) as the provider. This is a cheap-but-capable-
+// Package llm is the consolidator's model client, built on fantasy with an
+// OpenAI-compatible endpoint (Hyper by default). This is a cheap-but-capable-
 // model job (deepseek-v4-flash by default), not a frontier one.
 package llm
 
@@ -15,9 +15,11 @@ import (
 
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/openaicompat"
+
+	"github.com/taciturnaxolotl/lard/internal/config"
 )
 
-const defaultHyperBaseURL = "https://hyper.charm.land"
+const defaultBaseURL = "https://hyper.charm.land"
 const defaultModel = "deepseek-v4-flash"
 
 // Rate-limit retry budget. Hyper's throttle asks for "a few minutes", so the
@@ -33,46 +35,37 @@ type Client struct {
 	model fantasy.LanguageModel
 }
 
-// NewFromEnv builds a client from the environment:
-//
-//	LARD_HYPER_API_KEY (or HYPER_API_KEY) — required; a static hyper API key.
-//	LARD_MODEL          — default deepseek-v4-flash
-//	LARD_HYPER_BASE_URL — default https://hyper.charm.land
-//
-// Hyper's OpenAI-compatible endpoint drives the model, same as crush.
-func NewFromEnv(ctx context.Context) (*Client, error) {
-	key := os.Getenv("LARD_HYPER_API_KEY")
+// New builds a client from the server config. The API key falls back to the
+// HYPER_API_KEY environment variable for convenience.
+func New(ctx context.Context, cfg config.LLM) (*Client, error) {
+	key := cfg.APIKey
 	if key == "" {
 		key = os.Getenv("HYPER_API_KEY")
 	}
 	if key == "" {
-		return nil, fmt.Errorf("no hyper API key: set LARD_HYPER_API_KEY or HYPER_API_KEY")
+		return nil, fmt.Errorf("no API key: set llm.api_key in config or LARD_HYPER_API_KEY / HYPER_API_KEY")
 	}
-	modelID := os.Getenv("LARD_MODEL")
+	modelID := cfg.Model
 	if modelID == "" {
 		modelID = defaultModel
+	}
+	base := strings.TrimRight(cfg.BaseURL, "/")
+	if base == "" {
+		base = defaultBaseURL
 	}
 	provider, err := openaicompat.New(
 		openaicompat.WithName("hyper"),
 		openaicompat.WithAPIKey(key),
-		openaicompat.WithBaseURL(hyperBaseURL()+"/v1"),
+		openaicompat.WithBaseURL(base+"/v1"),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("hyper provider: %w", err)
+		return nil, fmt.Errorf("llm provider: %w", err)
 	}
 	model, err := provider.LanguageModel(ctx, modelID)
 	if err != nil {
 		return nil, fmt.Errorf("model %q: %w", modelID, err)
 	}
 	return &Client{model: model}, nil
-}
-
-func hyperBaseURL() string {
-	base := os.Getenv("LARD_HYPER_BASE_URL")
-	if base == "" {
-		base = defaultHyperBaseURL
-	}
-	return strings.TrimRight(base, "/")
 }
 
 // Complete runs a single-turn completion and returns the text. Rate-limit

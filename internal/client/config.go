@@ -27,7 +27,7 @@ type Config struct {
 	// or a headless box where no browser is available.
 	Token string `json:"token,omitempty"`
 	// OAuth holds the browser-login credentials, used when the server runs
-	// LARD_AUTH=bearer. Preferred over Token: nothing to copy by hand, and it
+	// LARD_AUTH=oauth. Preferred over Token: nothing to copy by hand, and it
 	// carries the same identity as the rest of the user's tooling.
 	OAuth *OAuthToken `json:"oauth,omitempty"`
 }
@@ -113,7 +113,7 @@ func (c *Config) Verify(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if tok, err := c.Bearer(ctx, DefaultConfigPath()); err == nil && tok != "" {
+	if tok, err := c.BearerToken(ctx, DefaultConfigPath()); err == nil && tok != "" {
 		req.Header.Set("authorization", "Bearer "+tok)
 	}
 	resp, err := http.DefaultClient.Do(req)
@@ -143,14 +143,14 @@ func (c *Config) Verify(ctx context.Context) (string, error) {
 	return body.ClientID, nil
 }
 
-// Bearer returns the token to send, refreshing an expired OAuth access token
-// and persisting the new one. It is the single place that decides between
-// OAuth and a static secret, so callers never branch on auth mode.
+// BearerToken returns the token to send, refreshing an expired OAuth access
+// token and persisting the new one. It is the single place that decides
+// between OAuth and a static secret, so callers never branch on auth mode.
 //
 // A refresh failure is fatal by design: silently falling back to no
 // credentials would turn an expired login into a stream of 401s in a log file
 // nobody reads.
-func (c *Config) Bearer(ctx context.Context, path string) (string, error) {
+func (c *Config) BearerToken(ctx context.Context, path string) (string, error) {
 	if c.OAuth != nil && c.OAuth.AccessToken != "" {
 		if !c.OAuth.expired() {
 			return c.OAuth.AccessToken, nil
@@ -161,7 +161,8 @@ func (c *Config) Bearer(ctx context.Context, path string) (string, error) {
 		}
 		c.OAuth.AccessToken = tok.AccessToken
 		c.OAuth.Expiry = tok.Expiry
-		// Indiko does not rotate refresh tokens, but honor one if it appears.
+		// Providers do not always rotate refresh tokens, but honor one if it
+		// appears.
 		if tok.RefreshToken != "" {
 			c.OAuth.RefreshToken = tok.RefreshToken
 		}

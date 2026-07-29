@@ -342,7 +342,7 @@ func uploader(ctx context.Context) (*client.Uploader, error) {
 	if err != nil {
 		return nil, err
 	}
-	tok, err := cfg.Bearer(ctx, path)
+	tok, err := cfg.BearerToken(ctx, path)
 	if err != nil {
 		return nil, err
 	}
