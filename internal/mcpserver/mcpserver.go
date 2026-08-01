@@ -184,6 +184,16 @@ func errResult(err error) *mcp.CallToolResult {
 }
 
 // HTTPHandler serves the MCP server over streamable HTTP.
+//
+// The SDK's DNS-rebinding guard rejects any request arriving on a loopback
+// socket that carries a non-loopback Host header. Behind a reverse proxy
+// that describes every legitimate request, so the guard is disabled here.
+// What it defends against — a browser tricked into reaching an
+// unauthenticated local server — does not apply: lard authenticates every
+// request and is reached through the proxy rather than directly.
 func HTTPHandler(s *mcp.Server) *mcp.StreamableHTTPHandler {
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil)
+	return mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return s },
+		&mcp.StreamableHTTPOptions{DisableLocalhostProtection: true},
+	)
 }
