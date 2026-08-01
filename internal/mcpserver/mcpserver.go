@@ -18,9 +18,19 @@ import (
 	"github.com/taciturnaxolotl/lard/internal/types"
 )
 
+// instructions is returned at initialize and concatenated into the agent's
+// system prompt. It can't carry the context bundle itself (the project isn't
+// known yet), so it just teaches the agent to call get_context first.
+const instructions = `lard is a long-term memory layer. At the start of a session, before doing project work, call get_context with the current workspace's git origin remote (gitRemote) and absolute path (path). It returns the user profile, an index of all memory subjects, and this project's area file if identified.
+
+Read other subjects with memory_read when their description looks relevant. Persist durable facts the user states with memory_append (one fact) or memory_write (full rewrite; read first for the version token). Skip transient detail.`
+
 // New builds the MCP server backed by the HTTP API server's store.
 func New(api *httpapi.Server) *mcp.Server {
-	s := mcp.NewServer(&mcp.Implementation{Name: "lard", Version: "0.2.0"}, nil)
+	s := mcp.NewServer(
+		&mcp.Implementation{Name: "lard", Version: "0.2.0"},
+		&mcp.ServerOptions{Instructions: instructions},
+	)
 
 	// get_context — the session-start injection bundle.
 	type getContextArgs struct {
