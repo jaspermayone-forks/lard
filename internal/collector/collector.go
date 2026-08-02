@@ -15,8 +15,11 @@ import (
 	"net/http"
 )
 
-// DefaultScopes is what a collector asks for: enough to identify the user.
-var DefaultScopes = []string{"profile"}
+// DefaultScopes is what a collector asks for: enough to identify the user,
+// plus offline_access so the authorization server issues a refresh token and
+// the collector keeps syncing after the first access token expires instead
+// of dying on the hour.
+var DefaultScopes = []string{"profile", "offline_access"}
 
 // Config describes the collector OAuth registration this server hands out.
 type Config struct {

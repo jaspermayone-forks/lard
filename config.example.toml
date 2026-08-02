@@ -26,8 +26,10 @@ required_scopes = []     # scopes every token must carry
 
 # Collector registration (published to edge collectors)
 [collector]
-client_id = ""            # the OAuth client ID collectors should use
-scopes = ["profile"]      # scopes the collector should request
+client_id = ""                              # the OAuth client ID collectors should use
+scopes = ["profile", "offline_access"]      # scopes the collector should request
+                                            # (offline_access -> refresh token, so the
+                                            # collector survives past the 1h access token)
 
 # Auto-consolidation (runs when uploads go quiet)
 [consolidate]
