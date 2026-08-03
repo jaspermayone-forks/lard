@@ -103,7 +103,6 @@ only has to re-authenticate.`,
 }
 
 func printConnected(cfg *client.Config) {
-	fmt.Println()
 	fmt.Printf("Connected to %s via %s.\n", ui.Link(cfg.URL, "lard-server"), cfg.AuthMode())
 }
 

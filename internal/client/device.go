@@ -226,5 +226,5 @@ func printDevicePrompt(auth *DeviceAuth, openBrowser bool) {
 	if auth.UserCode != "" {
 		fmt.Printf("Your code: %s\n", ui.Success(auth.UserCode))
 	}
-	fmt.Println(ui.Subtle("Waiting for you to authorize..."))
+	fmt.Println("Waiting for you to authorize...")
 }
