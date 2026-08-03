@@ -17,6 +17,7 @@ import (
 
 	"charm.land/fang/v2"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/taciturnaxolotl/lard/internal/client"
 	"github.com/taciturnaxolotl/lard/internal/dotenv"
@@ -104,6 +105,26 @@ only has to re-authenticate.`,
 
 func printConnected(cfg *client.Config) {
 	fmt.Printf("Connected to %s via %s.\n", ui.Link(cfg.URL, "lard-server"), cfg.AuthMode())
+}
+
+// plural renders a count with its singular/plural noun: "1 session", "3 sessions".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// shortID trims a session id to its first segment so progress lines stay
+// readable: "3f1ab2c9-4d0e-…" not the whole uuid.
+func shortID(id string) string {
+	if i := strings.IndexAny(id, "-:"); i > 0 {
+		return id[:i]
+	}
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // --- collection ---
@@ -205,7 +226,43 @@ only needed to skip the wait.`,
 			if err != nil {
 				return err
 			}
-			return up.Consolidate(cmd.Context())
+			fmt.Println("Consolidating on the server; a backfill can take a while...")
+			interactive := term.IsTerminal(int(os.Stdout.Fd()))
+			updating := false
+			progress := func(phase, name string, done, total int) {
+				verb, subject := "extracting", "session "+shortID(name)
+				if phase == "synthesize" {
+					verb, subject = "synthesizing", name
+				}
+				line := fmt.Sprintf("%s %s (%d/%d)", verb, subject, done, total)
+				if interactive {
+					fmt.Printf("\r\033[2K%s", line)
+					updating = true
+				} else {
+					fmt.Println(line)
+				}
+			}
+			res, err := up.Consolidate(cmd.Context(), progress)
+			if updating {
+				fmt.Println()
+			}
+			if err != nil {
+				return err
+			}
+			switch {
+			case res.Extracted > 0 && res.Synthesized > 0:
+				fmt.Printf("Done: extracted facts from %s, rewrote %s.\n",
+					plural(res.Extracted, "session"), plural(res.Synthesized, "subject file"))
+			case res.Extracted > 0:
+				fmt.Printf("Done: extracted facts from %s; no subjects needed rewriting.\n",
+					plural(res.Extracted, "session"))
+			case res.Synthesized > 0:
+				fmt.Printf("Done: rewrote %s; nothing new to extract.\n",
+					plural(res.Synthesized, "subject file"))
+			default:
+				fmt.Println("Done: nothing to do, memory is up to date.")
+			}
+			return nil
 		},
 	}
 }

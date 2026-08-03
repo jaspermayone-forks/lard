@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/auth"
@@ -26,6 +27,58 @@ type Server struct {
 	llm      *llm.Client
 	mux      *http.ServeMux
 	auto     *autoConsolidator
+
+	// Single-flight consolidation. A manual /consolidate and the quiet
+	// timer both funnel through one job, so concurrent callers never start
+	// competing passes, and a caller going away doesn't kill the pass.
+	consolMu  sync.Mutex
+	consolJob *consolidationJob
+}
+
+// consolidationJob is one in-flight consolidation pass.
+type consolidationJob struct {
+	done chan struct{} // closed when the pass finishes
+	res  pipeline.Result
+	err  error
+
+	// Progress fan-out. Each listener gets events as steps finish; a slow
+	// listener is dropped rather than stalling the pass.
+	mu   sync.Mutex
+	subs []chan pipeline.ProgressEvent
+}
+
+// publish fans one event out to every listener. Buffered sends mean a
+// consumer going away can never block consolidation.
+func (j *consolidationJob) publish(ev pipeline.ProgressEvent) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for _, ch := range j.subs {
+		select {
+		case ch <- ev:
+		default:
+		}
+	}
+}
+
+// subscribe registers a progress listener. The returned channel is
+// unregistered when done is closed or unsubscribe is called.
+func (j *consolidationJob) subscribe() chan pipeline.ProgressEvent {
+	ch := make(chan pipeline.ProgressEvent, 64)
+	j.mu.Lock()
+	j.subs = append(j.subs, ch)
+	j.mu.Unlock()
+	return ch
+}
+
+func (j *consolidationJob) unsubscribe(ch chan pipeline.ProgressEvent) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for i, s := range j.subs {
+		if s == ch {
+			j.subs = append(j.subs[:i], j.subs[i+1:]...)
+			break
+		}
+	}
 }
 
 // New builds the HTTP server. llmClient may be nil if consolidation is never
@@ -45,7 +98,7 @@ func (s *Server) EnableAutoConsolidate(after, maxWait time.Duration) {
 		return
 	}
 	s.auto = newAutoConsolidator(after, maxWait, func(ctx context.Context) error {
-		_, err := s.Consolidator().Run(ctx, 0)
+		_, err := s.consolidate(ctx)
 		return err
 	})
 	slog.Info("auto-consolidate enabled", "quiet_period", after, "max_wait", maxWait)
@@ -304,17 +357,106 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, errors.New("consolidation unavailable: no LLM client configured"))
 		return
 	}
+	job := s.startConsolidation()
+	events := job.subscribe()
+	defer job.unsubscribe(events)
+
+	// One JSON object per line: a progress event as each step finishes, then
+	// a final line carrying the result (or error). A client that goes away
+	// just stops reading; the pass keeps running server-side.
+	w.Header().Set("content-type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	writeLine := func(v any) bool {
+		if err := json.NewEncoder(w).Encode(v); err != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
+	progressLine := func(ev pipeline.ProgressEvent) bool {
+		return writeLine(map[string]any{"phase": ev.Phase, "name": ev.Name, "done": ev.Done, "total": ev.Total})
+	}
+
+	for {
+		select {
+		case ev := <-events:
+			if !progressLine(ev) {
+				return
+			}
+		case <-job.done:
+			// Events published before the pass ended may still be buffered;
+			// drain them so the summary is always the last line.
+			for {
+				select {
+				case ev := <-events:
+					if !progressLine(ev) {
+						return
+					}
+				default:
+					goto finished
+				}
+			}
+		finished:
+			out := map[string]any{
+				"finished":    true,
+				"extracted":   job.res.Extracted,
+				"synthesized": job.res.Synthesized,
+			}
+			if job.err != nil {
+				out["error"] = job.err.Error()
+			}
+			writeLine(out)
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// consolidate waits for one consolidation pass and returns its result.
+// Used by the quiet-timer auto-pass, which wants the outcome but not the
+// step-by-step stream.
+func (s *Server) consolidate(ctx context.Context) (pipeline.Result, error) {
+	job := s.startConsolidation()
+	select {
+	case <-job.done:
+		return job.res, job.err
+	case <-ctx.Done():
+		return pipeline.Result{}, ctx.Err()
+	}
+}
+
+// startConsolidation starts a consolidation pass, or joins the one already
+// running. The pass is single-flight and detached from the caller: a manual
+// call, a second caller mid-pass, and the quiet timer all share one job, and
+// a client going away never kills work already in flight. Both phases are
+// checkpointed, so even a server restart resumes where the pass stopped.
+func (s *Server) startConsolidation() *consolidationJob {
+	s.consolMu.Lock()
+	defer s.consolMu.Unlock()
+	if s.consolJob != nil {
+		return s.consolJob
+	}
+	job := &consolidationJob{done: make(chan struct{})}
+	s.consolJob = job
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
+		runCtx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 		defer cancel()
-		n, err := s.Consolidator().Run(ctx, 0)
-		if err != nil {
-			slog.Error("consolidate", "error", err)
+		job.res, job.err = s.Consolidator().Run(runCtx, 0, job.publish)
+		close(job.done)
+		s.consolMu.Lock()
+		s.consolJob = nil
+		s.consolMu.Unlock()
+		if job.err != nil {
+			slog.Error("consolidate", "error", job.err)
 		} else {
-			slog.Info("consolidate done", "extracted", n)
+			slog.Info("consolidate done", "extracted", job.res.Extracted, "synthesized", job.res.Synthesized)
 		}
 	}()
-	writeJSON(w, 202, map[string]string{"status": "started"})
+	return job
 }
 
 // --- projects ---

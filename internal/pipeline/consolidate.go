@@ -30,23 +30,42 @@ func New(st *store.Store, client *llm.Client, resolve func(*types.ProjectHints) 
 	return &Consolidator{store: st, llm: client, Resolve: resolve}
 }
 
+// Result summarizes one consolidation pass.
+type Result struct {
+	Extracted   int // sessions that yielded facts this pass
+	Synthesized int // subject files rewritten
+}
+
+// ProgressEvent reports one completed step of a pass, so callers can show
+// live feedback instead of a single summary at the end. Total is an estimate:
+// sessions uploaded mid-pass push it up as later batches are discovered.
+type ProgressEvent struct {
+	Phase string // "extract" or "synthesize"
+	Name  string // the session or subject path that finished
+	Done  int    // steps completed so far in this phase
+	Total int    // steps expected in this phase
+}
+
 // Run drains all pending work: extract facts from every unextracted session,
 // then synthesize every dirty subject. Both phases are checkpointed, so a
 // crash or re-run resumes cleanly. limit>0 caps sessions extracted this run.
-func (c *Consolidator) Run(ctx context.Context, limit int) (extracted int, err error) {
-	extracted, err = c.extractPhase(ctx, limit)
+// progress, when non-nil, is called as each step finishes.
+func (c *Consolidator) Run(ctx context.Context, limit int, progress func(ProgressEvent)) (Result, error) {
+	var res Result
+	extracted, err := c.extractPhase(ctx, limit, progress)
+	res.Extracted = extracted
 	if err != nil {
-		return extracted, err
+		return res, err
 	}
-	if err := c.synthesizePhase(ctx); err != nil {
-		return extracted, err
-	}
-	return extracted, nil
+	synthesized, err := c.synthesizePhase(ctx, progress)
+	res.Synthesized = synthesized
+	return res, err
 }
 
 // extractPhase runs extraction across unextracted sessions in parallel,
 // persisting facts per session. Each session is an independent checkpoint.
-func (c *Consolidator) extractPhase(ctx context.Context, limit int) (int, error) {
+// progress, when non-nil, is called as each session finishes.
+func (c *Consolidator) extractPhase(ctx context.Context, limit int, progress func(ProgressEvent)) (int, error) {
 	total := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -76,6 +95,8 @@ func (c *Consolidator) extractPhase(ctx context.Context, limit int) (int, error)
 		sem := make(chan struct{}, extractConcurrency)
 		var mu sync.Mutex
 		done := 0
+		batchStart := total
+		batchTotal := total + len(sessions) // best estimate; later batches may follow
 		for _, sess := range sessions {
 			wg.Add(1)
 			sem <- struct{}{}
@@ -83,15 +104,22 @@ func (c *Consolidator) extractPhase(ctx context.Context, limit int) (int, error)
 				defer wg.Done()
 				defer func() { <-sem }()
 				if err := c.extractSession(ctx, s, listing); err != nil {
+					if ctx.Err() != nil {
+						// The pass is going away; leave the session queued
+						// so a later pass still gets its facts.
+						return
+					}
 					slog.Error("extract: session failed", "session", s.SessionID, "error", err)
 					// Mark extracted-with-no-facts so a poison session doesn't
 					// wedge the queue; it simply contributes nothing.
 					_ = c.store.SaveFacts(s.Source, s.SessionID, time.Unix(s.EndedAt, 0).UTC(), nil)
-					return
 				}
 				mu.Lock()
 				done++
 				mu.Unlock()
+				if progress != nil {
+					progress(ProgressEvent{Phase: "extract", Name: s.SessionID, Done: batchStart + done, Total: batchTotal})
+				}
 			}(sess)
 		}
 		wg.Wait()
@@ -190,15 +218,17 @@ func (c *Consolidator) ensureSubject(kind types.SubjectKind, name, desc string, 
 }
 
 // synthesizePhase rewrites every subject that has facts newer than its last
-// synthesis, in parallel across subjects (each writes a distinct file).
-func (c *Consolidator) synthesizePhase(ctx context.Context) error {
+// synthesis, in parallel across subjects (each writes a distinct file). It
+// returns how many subjects it rewrote. progress, when non-nil, is called as
+// each subject finishes.
+func (c *Consolidator) synthesizePhase(ctx context.Context, progress func(ProgressEvent)) (int, error) {
 	dirty, err := c.store.DirtySubjects()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(dirty) == 0 {
 		slog.Info("synthesize: nothing dirty")
-		return nil
+		return 0, nil
 	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, synthConcurrency)
@@ -217,15 +247,18 @@ func (c *Consolidator) synthesizePhase(ctx context.Context) error {
 			if err != nil {
 				failed++
 				slog.Error("synthesize: subject failed", "kind", kind, "name", name, "error", err)
-				return
+			} else {
+				ok++
+				slog.Info("synthesize: subject done", "kind", kind, "name", name, "progress", ok+failed, "total", len(dirty))
 			}
-			ok++
-			slog.Info("synthesize: subject done", "kind", kind, "name", name, "progress", ok+failed, "total", len(dirty))
+			if progress != nil {
+				progress(ProgressEvent{Phase: "synthesize", Name: types.SubjectPath(kind, name), Done: ok + failed, Total: len(dirty)})
+			}
 		}(kind, name)
 	}
 	wg.Wait()
 	slog.Info("synthesize: complete", "subjects", len(dirty), "written", ok, "failed", failed)
-	return nil
+	return ok, nil
 }
 
 func (c *Consolidator) synthesizeSubject(ctx context.Context, kind types.SubjectKind, name string) error {
