@@ -21,9 +21,18 @@ import (
 // instructions is returned at initialize and concatenated into the agent's
 // system prompt. It can't carry the context bundle itself (the project isn't
 // known yet), so it just teaches the agent to call get_context first.
-const instructions = `lard is a long-term memory layer. At the start of a session, before doing project work, call get_context with the current workspace's git origin remote (gitRemote) and absolute path (path). It returns the user profile, an index of all memory subjects, and this project's area file if identified.
+const instructions = `lard is the user's long-term memory: markdown subject files about the user (profile), their projects (areas/), cross-cutting interests and preferences (topics/), and people.
 
-Read other subjects with memory_read when their description looks relevant. Persist durable facts the user states with memory_append (one fact) or memory_write (full rewrite; read first for the version token). Skip transient detail.`
+Read:
+1. At session start, before any project work, call get_context with the workspace's git origin remote (gitRemote) and absolute path (path). It returns the profile, this project's area file, and an index of every other subject (path + description + aliases).
+2. Treat what you get as established context: let the profile and area shape defaults and choices instead of asking the user again.
+3. When the task plausibly touches a topic or another project in the index, memory_read that subject before working. Descriptions are retrieval keys.
+
+Write:
+- When the user states a durable fact — a decision, convention, deploy target, host, version, preference — persist it in the same session with memory_append. One specific statement per call, routed to the right subject: project specifics → its area, cross-project preferences → a topic, identity → profile, people → people/<name>.
+- Carry the specifics: "deploys to Cloudflare Pages at s.dunkirk.sh" beats "has a deployment".
+- Skip anything true only for the current task, and anything the repo already shows.
+- memory_write is for full rewrites; memory_read first for the version token.`
 
 // New builds the MCP server backed by the HTTP API server's store.
 func New(api *httpapi.Server) *mcp.Server {

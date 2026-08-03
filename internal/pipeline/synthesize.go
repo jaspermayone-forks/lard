@@ -9,16 +9,18 @@ import (
 	"github.com/taciturnaxolotl/lard/internal/types"
 )
 
-const synthesizeSystem = `You maintain one memory file about a single subject. You are given the subject's kind, its current file body (may be empty), and a list of facts gathered from the user's sessions. Rewrite the file body as clean, durable prose.
+const synthesizeSystem = `You maintain one memory file about a single subject. You are given the subject's kind, its current file body (may be empty), and a list of facts gathered from the user's sessions. Rewrite the file body so a future assistant reading it knows the subject without any other context.
 
 Rules:
-- Produce a tight set of bullet points, each a durable fact. Merge related facts into single coherent bullets; do not just concatenate.
+- Produce a tight set of bullet points, each a self-contained fact. Merge related facts into single coherent bullets; do not just concatenate.
+- Keep the specifics. Names, URLs, domains, hosts, paths, versions, stack components, deploy targets, and the reasoning behind decisions are the value of memory — merging bullets must never mean stripping them out. "Cloudflare Workers-based PWA deployed on Cloudflare Pages at s.dunkirk.sh" is the right level; "a web project" is not.
 - Preserve everything in the current body that is not contradicted; integrate the new facts. This is a revise-in-place, not a fresh write — respect prior content (it may include the user's own edits).
 - When new facts supersede old ones (a project changed stack, a role changed), replace the stale statement rather than keeping both.
-- Prefer durable phrasing over specifics that go stale. Drop task-local noise that slipped through.
+- Prefer durable phrasing over specifics that go stale, but never use that as an excuse to drop load-bearing specifics. Drop task-local noise that slipped through.
+- For an "area" subject, aim to cover, when known: what the project is, its stack and key libraries, where it runs/deploys, conventions and decisions (with reasons where given), and current goals or open threads.
 - Every bullet starts with a provenance tag in brackets: [stated] (user said it), [observed], or [inferred]. Use [stated] unless the input fact says otherwise.
 - For a "profile" subject: keep ONLY durable identity (name, role, education, location, contact, pronouns). Move anything project-specific out (omit it — it lives elsewhere).
-- Keep it concise. A subject file is an overview, not a transcript. Aim for the smallest set of bullets that captures the durable truth.
+- Keep it concise — a memory file, not a transcript — but favor completeness over brevity when they conflict. A rich 15-bullet subject beats a vague 4-bullet one.
 
 Output ONLY the file body (the bullet lines). No frontmatter, no headings, no preamble.`
 
