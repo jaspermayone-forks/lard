@@ -123,6 +123,9 @@ func (c *Config) Verify(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized:
+		if c.OAuth != nil {
+			return "", errors.New("server rejected the login (401); re-run 'lard-client login'")
+		}
 		return "", errors.New("server rejected the token (401); check LARD_TOKEN matches the server's")
 	case resp.StatusCode == http.StatusForbidden:
 		return "", errors.New("token is valid but not allowed for this server (403); check the server's allowlist")
