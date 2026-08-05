@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/auth"
+	"github.com/taciturnaxolotl/lard/internal/backup"
 	"github.com/taciturnaxolotl/lard/internal/collector"
 	"github.com/taciturnaxolotl/lard/internal/config"
 	"github.com/taciturnaxolotl/lard/internal/dotenv"
@@ -24,17 +25,38 @@ import (
 	"github.com/taciturnaxolotl/lard/internal/tenant"
 )
 
+const usage = `lard is the central memory service.
+
+  lard                     run the server
+  lard backup <dir>        copy every store into <dir>, live, without stopping
+  lard restore <dir> [-f]  put a backup tree back where the server reads it
+`
+
 func main() {
-	if err := run(); err != nil {
+	var err error
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == "backup":
+		err = runBackup(os.Args[2:])
+	case len(os.Args) > 1 && os.Args[1] == "restore":
+		err = runRestore(os.Args[2:])
+	case len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "help"):
+		fmt.Print(usage)
+		return
+	case len(os.Args) > 1:
+		err = fmt.Errorf("unknown command %q\n\n%s", os.Args[1], usage)
+	default:
+		err = run()
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "lard:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+// loadConfig reads the server's configuration the same way for every command,
+// so a backup can never disagree with the running server about where the data
+// is.
+func loadConfig() (*config.Server, error) {
 	// Load .env before reading any config: auth mode lives there too, and a
 	// missed load would silently leave the service open.
 	dotenv.LoadDefault()
@@ -48,7 +70,7 @@ func run() error {
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return nil, fmt.Errorf("load config: %w", err)
 	}
 
 	// Fill in defaults for paths if not set.
@@ -60,6 +82,88 @@ func run() error {
 	}
 	if cfg.DataDir == "" {
 		cfg.DataDir = defaultDataDir()
+	}
+	return cfg, nil
+}
+
+// runBackup copies every store into a destination directory, laid out exactly
+// like the live one. Nothing is stopped: databases are snapshotted inside a
+// transaction and subject files are written by rename, so a backup tool
+// pointed at the destination sees a still directory.
+func runBackup(args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: lard backup <dir>")
+	}
+	dest := args[0]
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	res, err := backup.Run(dest, backup.Options{
+		MultiUser: cfg.MultiUser,
+		DB:        cfg.DB,
+		MemoryDir: cfg.MemoryDir,
+		DataDir:   cfg.DataDir,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("backed up %d store(s) to %s (%.1f MiB)\n", len(res.Sources), dest, float64(res.Bytes)/(1<<20))
+	for _, name := range res.Sources {
+		fmt.Println("  " + name)
+	}
+	return nil
+}
+
+// runRestore puts a backup tree back where the server reads it. Stop the
+// server first: this rewrites the files underneath it.
+func runRestore(args []string) error {
+	var src string
+	var force bool
+	for _, a := range args {
+		switch a {
+		case "-f", "--force":
+			force = true
+		default:
+			if src != "" {
+				return fmt.Errorf("usage: lard restore <dir> [--force]")
+			}
+			src = a
+		}
+	}
+	if src == "" {
+		return fmt.Errorf("usage: lard restore <dir> [--force]")
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	res, err := backup.Restore(src, backup.Options{
+		MultiUser: cfg.MultiUser,
+		DB:        cfg.DB,
+		MemoryDir: cfg.MemoryDir,
+		DataDir:   cfg.DataDir,
+	}, force)
+	if err != nil {
+		return err
+	}
+	for _, aside := range res.MovedAside {
+		fmt.Println("kept previous data at " + aside)
+	}
+	fmt.Printf("restored %d path(s) from %s (%.1f MiB)\n", len(res.Sources), src, float64(res.Bytes)/(1<<20))
+	for _, dst := range res.Sources {
+		fmt.Println("  " + dst)
+	}
+	return nil
+}
+
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
 	}
 
 	// Multi-user memory is keyed by the identity on the token, and only oauth
@@ -110,7 +214,11 @@ func run() error {
 		// open a brand new empty database and say nothing. Refuse instead, and
 		// name the directory the data is actually in.
 		if tenants := tenant.List(tenant.Layout{Root: cfg.DataDir}); len(tenants) > 0 {
-			if _, err := os.Stat(cfg.DB); err != nil {
+			// Empty counts as absent. A backup hook running
+			// "sqlite3 <db> PRAGMA wal_checkpoint" against a path that moved
+			// leaves a 0-byte file behind, and that file must not be mistaken
+			// for a database worth serving.
+			if info, err := os.Stat(cfg.DB); err != nil || info.Size() == 0 {
 				return fmt.Errorf("multi_user is off but %d tenant(s) hold the memory under %s; "+
 					"turn multi_user back on, or move %s/{lard.db,memory} to %s and %s",
 					len(tenants), cfg.DataDir, filepath.Join(cfg.DataDir, tenants[0]), cfg.DB, cfg.MemoryDir)

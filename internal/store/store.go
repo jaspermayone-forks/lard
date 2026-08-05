@@ -65,6 +65,43 @@ func Open(dbPath, memDir string) (*Store, error) {
 // Close closes the underlying connection.
 func (s *Store) Close() error { return s.db.Close() }
 
+// Snapshot writes a consistent copy of a live database to destPath.
+//
+// VACUUM INTO reads the source inside one transaction, so the copy is a single
+// point in time no matter what is being written meanwhile. That is the whole
+// reason it exists here: copying the database file directly (what a backup
+// tool does) can read page 1 before a write and page 900 after it, producing a
+// file that was never a valid database. Checkpointing the WAL first does not
+// help, since it does nothing about the writes that follow.
+//
+// The source is opened without running migrations: a backup must never be the
+// thing that changes the schema of a database another process has open.
+func Snapshot(dbPath, destPath string) error {
+	if _, err := os.Stat(dbPath); err != nil {
+		return fmt.Errorf("snapshot source %s: %w", dbPath, err)
+	}
+	params := url.Values{}
+	params.Set("_pragma", "busy_timeout(30000)")
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?%s", dbPath, params.Encode()))
+	if err != nil {
+		return fmt.Errorf("open %s: %w", dbPath, err)
+	}
+	defer db.Close()
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o700); err != nil {
+		return err
+	}
+	// VACUUM INTO refuses to overwrite, so a previous run's file has to go
+	// first. Only ever the exact file we are about to write.
+	if err := os.Remove(destPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if _, err := db.Exec(`VACUUM INTO ?`, destPath); err != nil {
+		return fmt.Errorf("snapshot %s: %w", dbPath, err)
+	}
+	return nil
+}
+
 // MemDir returns the on-disk root of the subject files.
 func (s *Store) MemDir() string { return s.memDir }
 

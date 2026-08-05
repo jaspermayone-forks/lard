@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/taciturnaxolotl/lard/internal/auth"
 	"github.com/taciturnaxolotl/lard/internal/store"
 )
 
@@ -25,7 +26,12 @@ type Layout struct{ Root string }
 // Slug turns an identity (an authorization server "me" URL) into a directory
 // name: a readable prefix for whoever is reading `ls`, plus a hash so that two
 // identities never collide and nothing from the URL can escape the root.
+//
+// The identity is normalized first, on auth's definition of sameness. A
+// trailing slash appearing or vanishing between two tokens must not hand the
+// same person a second, empty memory.
 func Slug(subject string) string {
+	subject = auth.NormalizeSubject(subject)
 	sum := sha256.Sum256([]byte(subject))
 	digest := hex.EncodeToString(sum[:])[:12]
 
@@ -85,6 +91,31 @@ func (l Layout) Exists(slug string) bool {
 	return err == nil
 }
 
+// isSlug reports whether a directory name is one Slug could have produced:
+// something readable, then a dash, then twelve hex digits.
+//
+// Holding directories to that shape matters because the data root collects
+// company over time. A restore parks the data it replaced next to the tenant
+// it replaced, and that copy has a lard.db in it; without this check it would
+// be counted as a tenant, backed up on every run, and quietly doubled forever.
+func isSlug(name string) bool {
+	i := strings.LastIndexByte(name, '-')
+	if i <= 0 {
+		return false
+	}
+	digest := name[i+1:]
+	if len(digest) != 12 {
+		return false
+	}
+	for i := 0; i < len(digest); i++ {
+		c := digest[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // List names the tenants that already have a directory under the root.
 func List(l Layout) []string {
 	entries, err := os.ReadDir(l.Root)
@@ -93,7 +124,7 @@ func List(l Layout) []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || !isSlug(e.Name()) {
 			continue
 		}
 		if _, err := os.Stat(l.DBPath(e.Name())); err == nil {

@@ -33,6 +33,14 @@ lard-client service  install|uninstall|status
 lard-client consolidate                   # force a pass now
 ```
 
+## server
+
+```
+lard                        run the server
+lard backup <dir>           copy every store into <dir>, live, without stopping
+lard restore <dir> [-f]     put a backup tree back where the server reads it
+```
+
 ## Interfaces
 
 MCP at `POST /mcp`: `get_context`, `memory_list`, `memory_read`, `memory_write`, `memory_append`, `memory_delete`. add to crush:
@@ -142,6 +150,56 @@ Notes worth knowing before you flip it:
 - Tenants stay open for the life of the process, one SQLite connection each.
   That is the right trade for a homelab; it is not a design for thousands of
   users.
+
+## backups
+
+```sh
+lard backup /var/lib/lard/backup    # every store, live, nothing stops
+```
+
+The destination mirrors the live layout, so restoring is a move rather than a
+puzzle. Point your backup tool at that directory instead of at the running
+data directory.
+
+```
+backup/
+  lard.db                       # single-user
+  memory/
+  users/<slug>/{lard.db,memory} # multi-user, one per tenant
+```
+
+Databases are copied with SQLite's `VACUUM INTO`, which reads the source inside
+one transaction, so the copy is a single point in time no matter what is being
+written meanwhile. This is the part worth being careful about: copying a
+database file directly, which is what a backup tool does, can read page 1
+before a write and page 900 after it, giving you a file that was never a valid
+database. Checkpointing the WAL first does not help, because it says nothing
+about the writes that follow. That risk is the only real reason to stop a
+service for backup, and `VACUUM INTO` removes it.
+
+Subject files are copied plainly, which is safe because every write to them
+lands via a rename. A `.tmp` file seen mid-walk is a write in flight and is
+skipped; the finished version is either already in the tree or in the next run.
+
+### restoring
+
+A backup tool restores the paths it archived, and what it archived is the
+staging directory, not the live one. So the last step is putting the tree back
+where the server reads it:
+
+```sh
+restic restore latest --target /tmp/r
+lard restore /tmp/r/var/lib/lard/backup     # stop lard first
+```
+
+`lard restore` reads the same config the server does, so it knows whether to
+lay the tree out as one store or as tenants, and it refuses a backup of the
+wrong shape rather than putting data somewhere nothing reads it.
+
+It will not overwrite data that is already there without `--force`, and even
+then nothing is deleted: what was there is renamed to
+`<path>.superseded-<timestamp>` first. Rolling back to last night is exactly
+when today might still be wanted.
 
 ## auth
 

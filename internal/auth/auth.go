@@ -282,13 +282,22 @@ func (v *verifier) authorize(r *http.Request) (id Identity, status int, code, de
 // allowed reports whether v is in the list, treating an empty list as
 // unrestricted. Client IDs and identity URLs are compared with trailing
 // slashes normalized away, since providers and clients disagree about them.
+// NormalizeSubject is lard's definition of "the same person". An
+// authorization server is free to hand back https://me.example on one token
+// and https://Me.example/ on the next; anything keyed on identity must treat
+// those as one user, or the same person ends up with two of whatever is being
+// keyed (an allowlist miss, or a second empty memory).
+func NormalizeSubject(s string) string {
+	return strings.TrimRight(strings.ToLower(strings.TrimSpace(s)), "/")
+}
+
 func allowed(list []string, v string) bool {
 	if len(list) == 0 {
 		return true
 	}
-	got := strings.TrimRight(strings.ToLower(strings.TrimSpace(v)), "/")
+	got := NormalizeSubject(v)
 	for _, want := range list {
-		if strings.TrimRight(strings.ToLower(strings.TrimSpace(want)), "/") == got {
+		if NormalizeSubject(want) == got {
 			return true
 		}
 	}

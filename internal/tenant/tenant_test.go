@@ -17,6 +17,18 @@ func TestSlugIsReadableAndStable(t *testing.T) {
 	}
 }
 
+func TestSlugFollowsAuthsDefinitionOfSameness(t *testing.T) {
+	// The allowlist accepts all four of these as one person, so they must all
+	// open the same memory. A trailing slash showing up on a refreshed token
+	// must not silently hand the user an empty tenant.
+	want := Slug("https://dunkirk.sh/")
+	for _, variant := range []string{"https://dunkirk.sh", "https://Dunkirk.sh/", " https://dunkirk.sh/ "} {
+		if got := Slug(variant); got != want {
+			t.Fatalf("%q slugged to %q, want %q", variant, got, want)
+		}
+	}
+}
+
 func TestSlugSeparatesDistinctIdentities(t *testing.T) {
 	// Same readable prefix after filtering, different identities: the hash is
 	// the only thing keeping these two people's memory apart.
@@ -33,6 +45,25 @@ func TestSlugCannotEscapeTheRoot(t *testing.T) {
 		if s != filepath.Base(s) || strings.Contains(s, "..") {
 			t.Fatalf("subject %q produced traversable slug %q", subject, s)
 		}
+	}
+}
+
+func TestListSkipsWhatIsNotATenant(t *testing.T) {
+	l := Layout{Root: t.TempDir()}
+	slug := Slug("https://alice.example")
+	// A real tenant, and the copy a forced restore parks beside it. Both hold
+	// a lard.db; only one is a tenant.
+	for _, dir := range []string{slug, slug + ".superseded-20260805-160658", "notes", "lost+found"} {
+		if err := os.MkdirAll(l.Dir(dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(l.DBPath(dir), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := List(l)
+	if len(got) != 1 || got[0] != slug {
+		t.Fatalf("want just %q, got %v", slug, got)
 	}
 }
 
