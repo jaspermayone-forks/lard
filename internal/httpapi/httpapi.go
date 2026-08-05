@@ -2,6 +2,10 @@
 // memory file operations (list/read/write/append/edit/delete), ingest,
 // consolidation, and the project registry. The MCP server wraps the same
 // store paths.
+//
+// Every handler works against a tenant resolved from the request's identity,
+// so a single-user server and a multi-user one run the same code; see
+// tenant.go.
 package httpapi
 
 import (
@@ -14,26 +18,9 @@ import (
 	"time"
 
 	"github.com/taciturnaxolotl/lard/internal/auth"
-	"github.com/taciturnaxolotl/lard/internal/llm"
 	"github.com/taciturnaxolotl/lard/internal/pipeline"
-	"github.com/taciturnaxolotl/lard/internal/store"
 	"github.com/taciturnaxolotl/lard/internal/types"
 )
-
-// Server wires the store, registry, and consolidator to HTTP handlers.
-type Server struct {
-	st       *store.Store
-	registry *pipeline.Registry
-	llm      *llm.Client
-	mux      *http.ServeMux
-	auto     *autoConsolidator
-
-	// Single-flight consolidation. A manual /consolidate and the quiet
-	// timer both funnel through one job, so concurrent callers never start
-	// competing passes, and a caller going away doesn't kill the pass.
-	consolMu  sync.Mutex
-	consolJob *consolidationJob
-}
 
 // consolidationJob is one in-flight consolidation pass.
 type consolidationJob struct {
@@ -81,42 +68,7 @@ func (j *consolidationJob) unsubscribe(ch chan pipeline.ProgressEvent) {
 	}
 }
 
-// New builds the HTTP server. llmClient may be nil if consolidation is never
-// triggered from this process.
-func New(st *store.Store, llmClient *llm.Client) *Server {
-	s := &Server{st: st, registry: pipeline.NewRegistry(st), llm: llmClient, mux: http.NewServeMux()}
-	s.routes()
-	return s
-}
-
-// EnableAutoConsolidate makes the server consolidate on its own once uploads
-// go quiet, so memory stays current without anyone calling /consolidate. No-op
-// without an LLM client, since a pass would fail anyway.
-func (s *Server) EnableAutoConsolidate(after, maxWait time.Duration) {
-	if s.llm == nil {
-		slog.Warn("auto-consolidate disabled: no LLM client")
-		return
-	}
-	s.auto = newAutoConsolidator(after, maxWait, func(ctx context.Context) error {
-		_, err := s.consolidate(ctx)
-		return err
-	})
-	slog.Info("auto-consolidate enabled", "quiet_period", after, "max_wait", maxWait)
-}
-
-// StopAutoConsolidate cancels any pending scheduled pass.
-func (s *Server) StopAutoConsolidate() {
-	if s.auto != nil {
-		s.auto.Stop()
-	}
-}
-
-func (s *Server) Handler() http.Handler        { return s.mux }
-func (s *Server) Registry() *pipeline.Registry { return s.registry }
-func (s *Server) Store() *store.Store          { return s.st }
-func (s *Server) Consolidator() *pipeline.Consolidator {
-	return pipeline.New(s.st, s.llm, s.registry.Resolve)
-}
+func (s *Server) Handler() http.Handler { return s.mux }
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
@@ -149,10 +101,14 @@ func (s *Server) routes() {
 // --- context ---
 
 func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	projectID := r.URL.Query().Get("project")
 	if projectID == "" {
 		if hints := hintsFromQuery(r); hints != nil {
-			pid, err := s.registry.Resolve(hints)
+			pid, err := t.registry.Resolve(hints)
 			if err != nil {
 				writeErr(w, 500, err)
 				return
@@ -160,7 +116,7 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 			projectID = pid
 		}
 	}
-	bundle, err := s.ContextBundle(projectID)
+	bundle, err := t.ContextBundle(projectID)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
@@ -168,42 +124,14 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, bundle)
 }
 
-// ContextBundle assembles the injection bundle: profile in full, the subject
-// listing, and (for a project session) that project's area file.
-func (s *Server) ContextBundle(projectID string) (*types.ContextBundle, error) {
-	bundle := &types.ContextBundle{ProjectID: projectID}
-	if profile, err := s.st.GetSubject(types.KindProfile, "profile"); err != nil {
-		return nil, err
-	} else if profile != nil {
-		bundle.Profile = profile.Body
-	}
-	listing, err := s.st.ListSubjects()
-	if err != nil {
-		return nil, err
-	}
-	bundle.Listing = listing
-	if projectID != "" {
-		name, err := s.st.SubjectForProject(projectID)
-		if err != nil {
-			return nil, err
-		}
-		if name != "" {
-			sub, err := s.st.GetSubject(types.KindArea, name)
-			if err != nil {
-				return nil, err
-			}
-			if sub != nil {
-				bundle.Area = sub.Body
-			}
-		}
-	}
-	return bundle, nil
-}
-
 // --- subject memory files ---
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	listing, err := s.st.ListSubjects()
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
+	listing, err := t.st.ListSubjects()
 	if err != nil {
 		writeErr(w, 500, err)
 		return
@@ -212,12 +140,16 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	sub, err := s.st.GetSubject(kind, name)
+	sub, err := t.st.GetSubject(kind, name)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
@@ -236,6 +168,10 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
@@ -252,7 +188,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	sub, err := pipeline.ApplyPatch(s.st, s.registry, kind, name, pipeline.SubjectPatch{
+	sub, err := pipeline.ApplyPatch(t.st, t.registry, kind, name, pipeline.SubjectPatch{
 		Body:        &body.Body,
 		Description: body.Description,
 		Aliases:     body.Aliases,
@@ -271,6 +207,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
@@ -283,7 +223,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	sub, err := pipeline.AppendLine(s.st, kind, name, body.Line)
+	sub, err := pipeline.AppendLine(t.st, kind, name, body.Line)
 	if err != nil {
 		writeErr(w, 400, err)
 		return
@@ -292,12 +232,16 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	kind, name, err := types.ParseSubjectPath(r.PathValue("path"))
 	if err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	if err := s.st.DeleteSubject(kind, name); err != nil {
+	if err := t.st.DeleteSubject(kind, name); err != nil {
 		writeErr(w, 500, err)
 		return
 	}
@@ -316,7 +260,8 @@ func writeConflict(w http.ResponseWriter, current *types.Subject) {
 // --- ingest & consolidate ---
 
 // handleWhoami reports the authenticated caller. Reaching this handler at all
-// means the credentials are good; the body says which identity they mapped to.
+// means the credentials are good; the body says which identity they mapped to,
+// and which memory that identity opens.
 func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"authenticated": true}
 	if id, ok := auth.IdentityFrom(r.Context()); ok {
@@ -324,40 +269,51 @@ func (s *Server) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		out["clientId"] = id.ClientID
 		out["scopes"] = id.Scopes
 	}
+	if t, err := s.TenantFor(r.Context()); err == nil && t.key != "" {
+		out["tenant"] = t.key
+	}
 	writeJSON(w, 200, out)
 }
 
 func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	var req types.IngestRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&req); err != nil {
 		writeErr(w, 400, err)
 		return
 	}
-	n, err := s.st.IngestSessions(req.Collector, req.Sessions)
+	n, err := t.st.IngestSessions(req.Collector, req.Sessions)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
 	}
 	for _, sess := range req.Sessions {
 		if sess.ProjectHints != nil {
-			if _, err := s.registry.Resolve(sess.ProjectHints); err != nil {
+			if _, err := t.registry.Resolve(sess.ProjectHints); err != nil {
 				slog.Warn("ingest: resolve project", "session", sess.SessionID, "error", err)
 			}
 		}
 	}
 	// New work landed: start (or extend) the quiet period before consolidating.
-	if n > 0 && s.auto != nil {
-		s.auto.Trigger()
+	if n > 0 && t.auto != nil {
+		t.auto.Trigger()
 	}
 	writeJSON(w, 200, map[string]int{"ingested": n})
 }
 
 func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
-	if s.llm == nil {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
+	if t.llm == nil {
 		writeErr(w, 503, errors.New("consolidation unavailable: no LLM client configured"))
 		return
 	}
-	job := s.startConsolidation()
+	job := t.startConsolidation()
 	events := job.subscribe()
 	defer job.unsubscribe(events)
 
@@ -419,8 +375,8 @@ func (s *Server) handleConsolidate(w http.ResponseWriter, r *http.Request) {
 // consolidate waits for one consolidation pass and returns its result.
 // Used by the quiet-timer auto-pass, which wants the outcome but not the
 // step-by-step stream.
-func (s *Server) consolidate(ctx context.Context) (pipeline.Result, error) {
-	job := s.startConsolidation()
+func (t *Tenant) consolidate(ctx context.Context) (pipeline.Result, error) {
+	job := t.startConsolidation()
 	select {
 	case <-job.done:
 		return job.res, job.err
@@ -429,31 +385,32 @@ func (s *Server) consolidate(ctx context.Context) (pipeline.Result, error) {
 	}
 }
 
-// startConsolidation starts a consolidation pass, or joins the one already
-// running. The pass is single-flight and detached from the caller: a manual
-// call, a second caller mid-pass, and the quiet timer all share one job, and
-// a client going away never kills work already in flight. Both phases are
-// checkpointed, so even a server restart resumes where the pass stopped.
-func (s *Server) startConsolidation() *consolidationJob {
-	s.consolMu.Lock()
-	defer s.consolMu.Unlock()
-	if s.consolJob != nil {
-		return s.consolJob
+// startConsolidation starts a consolidation pass for this tenant, or joins the
+// one already running. The pass is single-flight per tenant and detached from
+// the caller: a manual call, a second caller mid-pass, and the quiet timer all
+// share one job, and a client going away never kills work already in flight.
+// Both phases are checkpointed, so even a server restart resumes where the
+// pass stopped.
+func (t *Tenant) startConsolidation() *consolidationJob {
+	t.consolMu.Lock()
+	defer t.consolMu.Unlock()
+	if t.consolJob != nil {
+		return t.consolJob
 	}
 	job := &consolidationJob{done: make(chan struct{})}
-	s.consolJob = job
+	t.consolJob = job
 	go func() {
 		runCtx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 		defer cancel()
-		job.res, job.err = s.Consolidator().Run(runCtx, 0, job.publish)
+		job.res, job.err = t.Consolidator().Run(runCtx, 0, job.publish)
 		close(job.done)
-		s.consolMu.Lock()
-		s.consolJob = nil
-		s.consolMu.Unlock()
+		t.consolMu.Lock()
+		t.consolJob = nil
+		t.consolMu.Unlock()
 		if job.err != nil {
-			slog.Error("consolidate", "error", job.err)
+			slog.Error("consolidate", "tenant", t.key, "error", job.err)
 		} else {
-			slog.Info("consolidate done", "extracted", job.res.Extracted, "synthesized", job.res.Synthesized)
+			slog.Info("consolidate done", "tenant", t.key, "extracted", job.res.Extracted, "synthesized", job.res.Synthesized)
 		}
 	}()
 	return job
@@ -462,6 +419,10 @@ func (s *Server) startConsolidation() *consolidationJob {
 // --- projects ---
 
 func (s *Server) handleProjectResolve(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	var body struct {
 		Hints *types.ProjectHints `json:"hints"`
 	}
@@ -469,7 +430,7 @@ func (s *Server) handleProjectResolve(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err)
 		return
 	}
-	id, err := s.registry.Resolve(body.Hints)
+	id, err := t.registry.Resolve(body.Hints)
 	if err != nil {
 		writeErr(w, 500, err)
 		return
@@ -478,7 +439,11 @@ func (s *Server) handleProjectResolve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProjectList(w http.ResponseWriter, r *http.Request) {
-	projects, err := s.st.ListProjects()
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
+	projects, err := t.st.ListProjects()
 	if err != nil {
 		writeErr(w, 500, err)
 		return
@@ -487,6 +452,10 @@ func (s *Server) handleProjectList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProjectAlias(w http.ResponseWriter, r *http.Request) {
+	t := s.tenantOr(w, r)
+	if t == nil {
+		return
+	}
 	id := r.PathValue("id")
 	var body struct {
 		Kind  string `json:"kind"`
@@ -499,7 +468,7 @@ func (s *Server) handleProjectAlias(w http.ResponseWriter, r *http.Request) {
 	if body.Kind == "remote" {
 		body.Value = pipeline.NormalizeRemote(body.Value)
 	}
-	if err := s.st.AddAlias(id, body.Kind, body.Value); err != nil {
+	if err := t.st.AddAlias(id, body.Kind, body.Value); err != nil {
 		writeErr(w, 500, err)
 		return
 	}

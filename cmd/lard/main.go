@@ -21,6 +21,7 @@ import (
 	"github.com/taciturnaxolotl/lard/internal/llm"
 	"github.com/taciturnaxolotl/lard/internal/mcpserver"
 	"github.com/taciturnaxolotl/lard/internal/store"
+	"github.com/taciturnaxolotl/lard/internal/tenant"
 )
 
 func main() {
@@ -57,15 +58,20 @@ func run() error {
 	if cfg.MemoryDir == "" {
 		cfg.MemoryDir = defaultMemDir()
 	}
+	if cfg.DataDir == "" {
+		cfg.DataDir = defaultDataDir()
+	}
 
-	if err := os.MkdirAll(filepath.Dir(cfg.DB), 0o700); err != nil {
-		return err
+	// Multi-user memory is keyed by the identity on the token, and only oauth
+	// mode produces one. Without oauth every request would land on
+	// primary_user, so a missing primary_user means nothing can be served at
+	// all: say so at boot rather than 401ing every request.
+	if cfg.MultiUser && auth.Mode(cfg.Auth.Mode) != auth.ModeOAuth {
+		if cfg.PrimaryUser == "" {
+			return fmt.Errorf("multi_user needs auth.mode = \"oauth\" (or a primary_user to attribute unidentified requests to)")
+		}
+		slog.Warn("multi_user without oauth: every caller shares one memory", "primary_user", cfg.PrimaryUser)
 	}
-	st, err := store.Open(cfg.DB, cfg.MemoryDir)
-	if err != nil {
-		return fmt.Errorf("open store: %w", err)
-	}
-	defer st.Close()
 
 	// The LLM client is optional at boot: the API works without it, only
 	// /consolidate refuses.
@@ -76,14 +82,57 @@ func run() error {
 		llmClient = c
 	}
 
-	api := httpapi.New(st, llmClient)
+	var api *httpapi.Server
+	if cfg.MultiUser {
+		layout := tenant.Layout{Root: cfg.DataDir}
+		if err := os.MkdirAll(layout.Root, 0o700); err != nil {
+			return err
+		}
+		// A server that was single-user until this boot has a database full of
+		// memory the owner would otherwise silently lose. Move it in.
+		if cfg.PrimaryUser != "" {
+			slug := tenant.Slug(cfg.PrimaryUser)
+			moved, err := tenant.AdoptLegacy(layout, slug, cfg.DB, cfg.MemoryDir)
+			if err != nil {
+				return fmt.Errorf("adopt single-user data: %w", err)
+			}
+			if moved {
+				slog.Info("adopted single-user data", "user", cfg.PrimaryUser, "dir", layout.Dir(slug))
+			}
+		}
+		api = httpapi.NewMultiUser(httpapi.MultiUserConfig{
+			Layout:      layout,
+			PrimaryUser: cfg.PrimaryUser,
+		}, llmClient)
+	} else {
+		// Turning multi_user back off is the one way to lose sight of your
+		// memory: the tenant directories still hold it, but this path would
+		// open a brand new empty database and say nothing. Refuse instead, and
+		// name the directory the data is actually in.
+		if tenants := tenant.List(tenant.Layout{Root: cfg.DataDir}); len(tenants) > 0 {
+			if _, err := os.Stat(cfg.DB); err != nil {
+				return fmt.Errorf("multi_user is off but %d tenant(s) hold the memory under %s; "+
+					"turn multi_user back on, or move %s/{lard.db,memory} to %s and %s",
+					len(tenants), cfg.DataDir, filepath.Join(cfg.DataDir, tenants[0]), cfg.DB, cfg.MemoryDir)
+			}
+			slog.Warn("multi_user is off; tenant memory under data_dir is not being served", "tenants", len(tenants), "data_dir", cfg.DataDir)
+		}
+		if err := os.MkdirAll(filepath.Dir(cfg.DB), 0o700); err != nil {
+			return err
+		}
+		st, err := store.Open(cfg.DB, cfg.MemoryDir)
+		if err != nil {
+			return fmt.Errorf("open store: %w", err)
+		}
+		api = httpapi.New(st, llmClient)
+	}
+	defer api.Close()
 	// Consolidate on its own once uploads go quiet, so a remote collector
 	// feeding this server keeps memory current with nobody poking an endpoint.
 	if after := cfg.Consolidate.ConsolidateAfter(); after > 0 {
 		api.EnableAutoConsolidate(after, cfg.Consolidate.ConsolidateMaxWait())
 		defer api.StopAutoConsolidate()
 	}
-	mcpSrv := mcpserver.New(api)
 
 	authCfg := auth.Config{
 		Mode:              auth.Mode(cfg.Auth.Mode),
@@ -112,7 +161,7 @@ func run() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcpserver.HTTPHandler(mcpSrv))
+	mux.Handle("/mcp", mcpserver.HTTPHandler(api))
 	// The trailing slash covers RFC 9728's path-suffixed documents (e.g.
 	// /.well-known/oauth-protected-resource/mcp), which is what MCP clients
 	// actually request.
@@ -135,7 +184,11 @@ func run() error {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("lard listening", "addr", cfg.Addr, "db", cfg.DB, "memory", cfg.MemoryDir, "auth", authCfg.Mode, "mcp", cfg.Addr+"/mcp")
+	if cfg.MultiUser {
+		slog.Info("lard listening", "addr", cfg.Addr, "data", cfg.DataDir, "users", "multi", "auth", authCfg.Mode, "mcp", cfg.Addr+"/mcp")
+	} else {
+		slog.Info("lard listening", "addr", cfg.Addr, "db", cfg.DB, "memory", cfg.MemoryDir, "auth", authCfg.Mode, "mcp", cfg.Addr+"/mcp")
+	}
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -154,4 +207,11 @@ func defaultMemDir() string {
 		return filepath.Join(d, "lard", "memory")
 	}
 	return "memory"
+}
+
+func defaultDataDir() string {
+	if d, err := os.UserConfigDir(); err == nil {
+		return filepath.Join(d, "lard", "users")
+	}
+	return "users"
 }

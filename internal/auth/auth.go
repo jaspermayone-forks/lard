@@ -126,6 +126,12 @@ func IdentityFrom(ctx context.Context) (Identity, bool) {
 	return id, ok
 }
 
+// WithIdentity attaches an authenticated caller to a context, which is what
+// the middleware does on a successful authorization.
+func WithIdentity(ctx context.Context, id Identity) context.Context {
+	return context.WithValue(ctx, identityKey{}, id)
+}
+
 // Middleware enforces the configured mode on all requests except /healthz and
 // the OAuth discovery documents, which must stay reachable so an unauthorized
 // client can learn where to get a token.
@@ -154,7 +160,7 @@ func Middleware(cfg Config, next http.Handler) http.Handler {
 				writeChallenge(w, r, cfg, status, code, desc)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, id)))
+			next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), id)))
 		default:
 			writeChallenge(w, r, cfg, http.StatusInternalServerError, "server_error", "unknown auth mode")
 		}

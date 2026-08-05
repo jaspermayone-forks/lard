@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -34,8 +35,10 @@ Write:
 - Skip anything true only for the current task, and anything the repo already shows.
 - memory_write is for full rewrites; memory_read first for the version token.`
 
-// New builds the MCP server backed by the HTTP API server's store.
-func New(api *httpapi.Server) *mcp.Server {
+// New builds an MCP server bound to one tenant's memory. Tool handlers do not
+// see the HTTP request, so the tenant is resolved before the server is built
+// rather than inside each tool; HTTPHandler does that per request.
+func New(mem *httpapi.Tenant) *mcp.Server {
 	s := mcp.NewServer(
 		&mcp.Implementation{Name: "lard", Version: "0.2.0"},
 		&mcp.ServerOptions{Instructions: instructions},
@@ -56,14 +59,14 @@ func New(api *httpapi.Server) *mcp.Server {
 		if projectID == "" {
 			hints := &types.ProjectHints{GitRemote: args.GitRemote, Path: args.Path, Name: args.Name}
 			if *hints != (types.ProjectHints{}) {
-				pid, err := api.Registry().Resolve(hints)
+				pid, err := mem.Registry().Resolve(hints)
 				if err != nil {
 					return errResult(err), nil, nil
 				}
 				projectID = pid
 			}
 		}
-		bundle, err := api.ContextBundle(projectID)
+		bundle, err := mem.ContextBundle(projectID)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -76,7 +79,7 @@ func New(api *httpapi.Server) *mcp.Server {
 		Name:        "memory_list",
 		Description: `List all memory subjects: path, kind, description, aliases. The retrieval surface — decide what to read from descriptions alone.`,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, any, error) {
-		listing, err := api.Store().ListSubjects()
+		listing, err := mem.Store().ListSubjects()
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -96,7 +99,7 @@ func New(api *httpapi.Server) *mcp.Server {
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		sub, err := api.Store().GetSubject(kind, name)
+		sub, err := mem.Store().GetSubject(kind, name)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -123,7 +126,7 @@ func New(api *httpapi.Server) *mcp.Server {
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		sub, err := pipeline.ApplyPatch(api.Store(), api.Registry(), kind, name, pipeline.SubjectPatch{
+		sub, err := pipeline.ApplyPatch(mem.Store(), mem.Registry(), kind, name, pipeline.SubjectPatch{
 			Body:        &args.Body,
 			Description: args.Description,
 			Aliases:     args.Aliases,
@@ -156,7 +159,7 @@ func New(api *httpapi.Server) *mcp.Server {
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		sub, err := pipeline.AppendLine(api.Store(), kind, name, args.Line)
+		sub, err := pipeline.AppendLine(mem.Store(), kind, name, args.Line)
 		if err != nil {
 			return errResult(err), nil, nil
 		}
@@ -175,7 +178,7 @@ func New(api *httpapi.Server) *mcp.Server {
 		if err != nil {
 			return errResult(err), nil, nil
 		}
-		if err := api.Store().DeleteSubject(kind, name); err != nil {
+		if err := mem.Store().DeleteSubject(kind, name); err != nil {
 			return errResult(err), nil, nil
 		}
 		return textResult("deleted " + args.Path), nil, nil
@@ -192,7 +195,14 @@ func errResult(err error) *mcp.CallToolResult {
 	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}}
 }
 
-// HTTPHandler serves the MCP server over streamable HTTP.
+// HTTPHandler serves MCP over streamable HTTP, one MCP server per tenant.
+//
+// Tool handlers run on the session's goroutine and never see the HTTP request,
+// so the caller's identity cannot be read inside a tool. Instead the tenant is
+// resolved here, per request, and the MCP server bound to it is reused for
+// every later call from that identity. Sessions therefore belong to a tenant,
+// which is exactly the isolation we want: a session id minted for one user is
+// unknown to another's server.
 //
 // The SDK's DNS-rebinding guard rejects any request arriving on a loopback
 // socket that carries a non-loopback Host header. Behind a reverse proxy
@@ -200,9 +210,44 @@ func errResult(err error) *mcp.CallToolResult {
 // What it defends against — a browser tricked into reaching an
 // unauthenticated local server — does not apply: lard authenticates every
 // request and is reached through the proxy rather than directly.
-func HTTPHandler(s *mcp.Server) *mcp.StreamableHTTPHandler {
-	return mcp.NewStreamableHTTPHandler(
-		func(*http.Request) *mcp.Server { return s },
+func HTTPHandler(api *httpapi.Server) http.Handler {
+	var (
+		mu      sync.Mutex
+		servers = map[string]*mcp.Server{}
+	)
+	forTenant := func(t *httpapi.Tenant) *mcp.Server {
+		mu.Lock()
+		defer mu.Unlock()
+		if s, ok := servers[t.Key()]; ok {
+			return s
+		}
+		s := New(t)
+		servers[t.Key()] = s
+		return s
+	}
+
+	inner := mcp.NewStreamableHTTPHandler(
+		func(r *http.Request) *mcp.Server {
+			t, err := api.TenantFor(r.Context())
+			if err != nil {
+				return nil
+			}
+			return forTenant(t)
+		},
 		&mcp.StreamableHTTPOptions{DisableLocalhostProtection: true},
 	)
+
+	// Resolve once up front so an unidentified caller gets a 401 (which tells
+	// an MCP client to go get a token) instead of the SDK's bare 400.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := api.TenantFor(r.Context()); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, httpapi.ErrNoIdentity) {
+				status = http.StatusUnauthorized
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
 }

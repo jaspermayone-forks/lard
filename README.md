@@ -79,6 +79,9 @@ See `config.example.toml` for a ready-to-edit starting point.
 | `addr` | `LARD_ADDR` | `:7477` | listen address |
 | `db` | `LARD_DB` | `~/.config/lard/lard.db` | sqlite path (sessions, facts, registry) |
 | `memory_dir` | `LARD_MEMORY_DIR` | `~/.config/lard/memory` | subject files |
+| `multi_user` | `LARD_MULTI_USER` | `false` | one isolated store per authenticated identity |
+| `data_dir` | `LARD_DATA_DIR` | `~/.config/lard/users` | where tenant directories live |
+| `primary_user` | `LARD_PRIMARY_USER` | | identity owning requests with no OAuth identity |
 | `llm.base_url` | `LARD_HYPER_BASE_URL` | `https://hyper.charm.land` | OpenAI-compatible endpoint for consolidation |
 | `llm.model` | `LARD_MODEL` | `deepseek-v4-flash` | consolidation model |
 | `llm.api_key` | `LARD_HYPER_API_KEY` | | API key for consolidation (falls back to `HYPER_API_KEY`) |
@@ -93,6 +96,52 @@ See `config.example.toml` for a ready-to-edit starting point.
 | `collector.scopes` | `LARD_COLLECTOR_SCOPES` | `profile offline_access` | scopes the collector should request (`offline_access` gets a refresh token) |
 | `consolidate.after` | `LARD_CONSOLIDATE_AFTER` | `5m` | quiet period before a pass; `off` to disable |
 | `consolidate.max_wait` | `LARD_CONSOLIDATE_MAX_WAIT` | `30m` | cap on that wait during constant uploads |
+
+## multi-user
+
+Off by default: one server, one memory. Turn it on and every authenticated
+identity gets its own SQLite database and its own directory of subject files
+under `data_dir`. Nothing crosses between them, and no query in the store layer
+knows users exist.
+
+```toml
+multi_user = true
+data_dir = ""                            # ~/.config/lard/users
+primary_user = "https://you.example"
+
+[auth]
+mode = "oauth"                           # the identity comes off the token
+```
+
+Tenant directories are named `<readable>-<hash>`, derived from the identity's
+`me` url:
+
+```
+users/
+  dunkirk-sh-8f21c0a3b7de/
+    lard.db
+    memory/{profile.md,areas/,topics/,people/}
+```
+
+Notes worth knowing before you flip it:
+
+- **`oauth` mode is what makes this work.** `token` and `none` put no identity
+  on a request, so every caller would land on `primary_user`. lard warns at
+  boot if you do that, and refuses to start if `primary_user` is also unset.
+- **Your existing memory is adopted, not stranded.** On the first multi-user
+  boot, an existing `db` and `memory_dir` are *moved* into `primary_user`'s
+  tenant (wal and shm files included). It happens once and never overwrites a
+  tenant that already exists. Turning `multi_user` back off does not move it
+  back, so lard refuses to start rather than quietly serving a fresh empty
+  database; the error names the directory to move.
+- **Consolidation is per user.** Each tenant gets its own quiet timer, so one
+  person uploading an afternoon of sessions doesn't reset anyone else's clock.
+- **`auth.allowed_users` still gates the door.** Multi-user decides where an
+  accepted caller's memory lives, not who is accepted. Leave the allowlist
+  empty and anyone your authorization server vouches for gets a tenant.
+- Tenants stay open for the life of the process, one SQLite connection each.
+  That is the right trade for a homelab; it is not a design for thousands of
+  users.
 
 ## auth
 

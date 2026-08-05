@@ -7,6 +7,15 @@ addr = ":7477"
 db = ""          # defaults to ~/.config/lard/lard.db
 memory_dir = ""  # defaults to ~/.config/lard/memory
 
+# Multi-user: every authenticated identity gets its own database and its own
+# memory directory under data_dir. Nothing is shared between them. Needs
+# auth.mode = "oauth", since that is what puts an identity on the request.
+multi_user = false
+data_dir = ""      # defaults to ~/.config/lard/users
+primary_user = ""  # identity that owns requests carrying no OAuth identity.
+                   # On the first multi-user boot, an existing single-user
+                   # db + memory_dir are moved into this user's tenant.
+
 # Consolidation model (any OpenAI-compatible endpoint; Hyper is the default)
 [llm]
 base_url = ""    # defaults to https://hyper.charm.land

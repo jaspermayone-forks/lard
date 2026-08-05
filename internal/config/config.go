@@ -5,6 +5,7 @@ package config
 import (
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,9 +14,18 @@ import (
 
 // Server holds all runtime configuration for the lard server.
 type Server struct {
-	Addr        string      `toml:"addr" env:"LARD_ADDR" default:":7477"`
-	DB          string      `toml:"db" env:"LARD_DB"`
-	MemoryDir   string      `toml:"memory_dir" env:"LARD_MEMORY_DIR"`
+	Addr      string `toml:"addr" env:"LARD_ADDR" default:":7477"`
+	DB        string `toml:"db" env:"LARD_DB"`
+	MemoryDir string `toml:"memory_dir" env:"LARD_MEMORY_DIR"`
+
+	// MultiUser gives every authenticated identity its own isolated store
+	// under DataDir, instead of pooling everyone into one memory.
+	MultiUser bool   `toml:"multi_user" env:"LARD_MULTI_USER"`
+	DataDir   string `toml:"data_dir" env:"LARD_DATA_DIR"`
+	// PrimaryUser owns requests that carry no OAuth identity (token or none
+	// auth), and inherits a pre-existing single-user database on first boot.
+	PrimaryUser string `toml:"primary_user" env:"LARD_PRIMARY_USER"`
+
 	LLM         LLM         `toml:"llm"`
 	Auth        Auth        `toml:"auth"`
 	Collector   Collector   `toml:"collector"`
@@ -157,6 +167,12 @@ func applyEnvToStruct(v reflect.Value) {
 		switch fieldVal.Kind() {
 		case reflect.String:
 			fieldVal.SetString(val)
+		case reflect.Bool:
+			b, err := strconv.ParseBool(val)
+			if err != nil {
+				continue
+			}
+			fieldVal.SetBool(b)
 		case reflect.Slice:
 			if fieldVal.Type().Elem().Kind() == reflect.String {
 				fieldVal.Set(reflect.ValueOf(splitList(val)))
