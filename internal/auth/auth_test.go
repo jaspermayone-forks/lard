@@ -125,6 +125,50 @@ func TestOAuthAllowsListedClientIgnoringTrailingSlash(t *testing.T) {
 	}
 }
 
+func TestOAuthRejectsWrongAudience(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
+		"aud": "https://other.example.com",
+	})
+	h := Middleware(oauthConfig(srv.URL), okHandler())
+	if w := do(h, "Bearer good"); w.Code != http.StatusForbidden {
+		t.Fatalf("want 403 for a token minted for another resource, got %d", w.Code)
+	}
+}
+
+func TestOAuthAcceptsMatchingAudience(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
+		"aud": "https://lard.example.com/", // trailing slash is normalized away
+	})
+	h := Middleware(oauthConfig(srv.URL), okHandler())
+	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
+		t.Fatalf("want 200 for a token whose audience is this resource, got %d", w.Code)
+	}
+}
+
+func TestOAuthAcceptsAudienceArrayContainingResource(t *testing.T) {
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
+		"aud": []string{"https://other.example.com", "https://lard.example.com"},
+	})
+	h := Middleware(oauthConfig(srv.URL), okHandler())
+	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
+		t.Fatalf("want 200 when the aud array includes this resource, got %d", w.Code)
+	}
+}
+
+func TestOAuthAcceptsUnscopedToken(t *testing.T) {
+	// A token with no aud (unscoped) still passes — falls back to allowlists.
+	srv := fakeAuthServer(t, map[string]any{
+		"active": true, "me": "https://auth.example.com/u/kieran",
+	})
+	h := Middleware(oauthConfig(srv.URL), okHandler())
+	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
+		t.Fatalf("want 200 for an unscoped token, got %d", w.Code)
+	}
+}
+
 func TestOAuthRejectsUnlistedUser(t *testing.T) {
 	srv := fakeAuthServer(t, map[string]any{
 		"active": true, "me": "https://auth.example.com/u/stranger",

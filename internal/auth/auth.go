@@ -75,6 +75,11 @@ type Config struct {
 	// it would be a contradiction, and forcing the operator to repeat it in
 	// AllowedClientIDs is a step that only ever gets forgotten.
 	CollectorClientID string
+	// ResourceName and LogoURI are published in the protected-resource metadata
+	// so an authorization server can show a friendly name + icon on its consent
+	// screen. Empty ResourceName omits the field (clients fall back to the host).
+	ResourceName string
+	LogoURI      string
 }
 
 // clientAllowlist is the set of client ids accepted, including the collector
@@ -203,6 +208,17 @@ func resourceSuffix(path string) string {
 	return ""
 }
 
+// resourceID is lard's canonical resource identifier for a request path — the
+// same value published in the protected-resource metadata, and the audience a
+// token must carry to be accepted here.
+func (c Config) resourceID(r *http.Request) string {
+	base := strings.TrimRight(c.PublicURL, "/")
+	if base == "" {
+		base = requestBaseURL(r)
+	}
+	return base + resourceSuffix(r.URL.Path)
+}
+
 func checkToken(want string, r *http.Request) bool {
 	if want == "" {
 		return false
@@ -227,13 +243,45 @@ type verifier struct {
 
 // introspection is the subset of RFC 7662 fields lard acts on.
 type introspection struct {
-	Active   bool   `json:"active"`
-	Me       string `json:"me"`
-	Subject  string `json:"sub"`
-	ClientID string `json:"client_id"`
-	Scope    string `json:"scope"`
-	Audience string `json:"aud"`
-	Exp      int64  `json:"exp"`
+	Active   bool     `json:"active"`
+	Me       string   `json:"me"`
+	Subject  string   `json:"sub"`
+	ClientID string   `json:"client_id"`
+	Scope    string   `json:"scope"`
+	Audience audience `json:"aud"`
+	Exp      int64    `json:"exp"`
+}
+
+// audience decodes RFC 7662's `aud`, which may be a single string or an array.
+// An empty/absent value decodes to nil (the token is unscoped).
+type audience []string
+
+func (a *audience) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		if one == "" {
+			*a = nil
+		} else {
+			*a = audience{one}
+		}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return err
+	}
+	*a = many
+	return nil
+}
+
+// has reports whether the (already-normalized) resource id is one of the audiences.
+func (a audience) has(want string) bool {
+	for _, v := range a {
+		if NormalizeSubject(v) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (i introspection) subject() string {
@@ -257,6 +305,15 @@ func (v *verifier) authorize(r *http.Request) (id Identity, status int, code, de
 		return id, http.StatusUnauthorized, "invalid_token", "token is not active"
 	}
 	scopes := strings.Fields(res.Scope)
+	// RFC 8707: a token that names an audience must name THIS resource — the
+	// core defence against a confused deputy (a token minted for some other
+	// service the user authorized being replayed here). Unscoped tokens (no aud)
+	// fall through to the client/user allowlists, so older tokens keep working.
+	if len(res.Audience) > 0 && !res.Audience.has(NormalizeSubject(v.cfg.resourceID(r))) {
+		slog.Warn("auth: token audience mismatch",
+			"token_aud", []string(res.Audience), "want", v.cfg.resourceID(r))
+		return id, http.StatusForbidden, "invalid_token", "token was not issued for this resource"
+	}
 	// Denials are logged with the claims that failed. A 403 here is almost
 	// always an allowlist typo, and the operator cannot see the token's real
 	// client_id or "me" value any other way.
@@ -407,6 +464,12 @@ func ProtectedResourceMetadata(cfg Config) http.HandlerFunc {
 		}
 		if len(cfg.RequiredScopes) > 0 {
 			doc["scopes_supported"] = cfg.RequiredScopes
+		}
+		if cfg.ResourceName != "" {
+			doc["resource_name"] = cfg.ResourceName
+		}
+		if cfg.LogoURI != "" {
+			doc["logo_uri"] = cfg.LogoURI
 		}
 		w.Header().Set("content-type", "application/json")
 		w.Header().Set("cache-control", "public, max-age=3600")

@@ -251,6 +251,8 @@ func run() error {
 		AllowedUsers:      cfg.Auth.AllowedUsers,
 		RequiredScopes:    cfg.Auth.RequiredScopes,
 		CollectorClientID: cfg.Collector.ClientID,
+		ResourceName:      cfg.Auth.ResourceName,
+		LogoURI:           cfg.Auth.LogoURI,
 	}
 
 	// The collector registration: which OAuth client edge collectors adopt.

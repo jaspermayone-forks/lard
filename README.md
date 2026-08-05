@@ -100,6 +100,8 @@ See `config.example.toml` for a ready-to-edit starting point.
 | `auth.allowed_client_ids` | `LARD_OAUTH_CLIENT_IDS` | | comma list of client ids allowed to call lard |
 | `auth.allowed_users` | `LARD_OAUTH_USERS` | | comma list of `me` urls allowed to call lard |
 | `auth.required_scopes` | `LARD_OAUTH_SCOPES` | | comma list of scopes every token must carry |
+| `auth.resource_name` | `LARD_RESOURCE_NAME` | `lard` | friendly name shown on the AS consent screen (RFC 9728) |
+| `auth.logo_uri` | `LARD_LOGO_URI` | (lard logo) | icon shown on the AS consent screen; `""` for none |
 | `collector.client_id` | `LARD_COLLECTOR_CLIENT_ID` | | OAuth client id collectors should use |
 | `collector.scopes` | `LARD_COLLECTOR_SCOPES` | `profile offline_access` | scopes the collector should request (`offline_access` gets a refresh token) |
 | `consolidate.after` | `LARD_CONSOLIDATE_AFTER` | `5m` | quiet period before a pass; `off` to disable |

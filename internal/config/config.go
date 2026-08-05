@@ -50,6 +50,9 @@ type Auth struct {
 	AllowedClientIDs []string `toml:"allowed_client_ids" env:"LARD_OAUTH_CLIENT_IDS"`
 	AllowedUsers     []string `toml:"allowed_users" env:"LARD_OAUTH_USERS"`
 	RequiredScopes   []string `toml:"required_scopes" env:"LARD_OAUTH_SCOPES"`
+	// Shown on the authorization server's consent screen (RFC 9728 metadata).
+	ResourceName string `toml:"resource_name" env:"LARD_RESOURCE_NAME" default:"lard"`
+	LogoURI      string `toml:"logo_uri" env:"LARD_LOGO_URI" default:"https://l4.dunkirk.sh/i/qSu61P7PQtbT.webp"`
 }
 
 // Collector holds the collector OAuth registration.

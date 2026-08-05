@@ -32,6 +32,9 @@ public_url = ""        # lard's external URL; goes in the OAuth metadata
 allowed_client_ids = []  # OAuth client IDs allowed to access
 allowed_users = []       # user identity URLs allowed to access
 required_scopes = []     # scopes every token must carry
+# Shown on the authorization server's consent screen (RFC 9728 metadata).
+resource_name = "lard"                                    # friendly name
+logo_uri = "https://l4.dunkirk.sh/i/qSu61P7PQtbT.webp"    # icon (or "" for none)
 
 # Collector registration (published to edge collectors)
 [collector]
