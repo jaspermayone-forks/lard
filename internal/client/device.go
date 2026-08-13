@@ -120,6 +120,8 @@ type DeviceAuth struct {
 	VerificationURIComplete string `json:"verification_uri_complete"`
 	ExpiresIn               int    `json:"expires_in"`
 	Interval                int    `json:"interval"`
+	Error                   string `json:"error"`
+	ErrorDescription        string `json:"error_description"`
 }
 
 // startDevice asks the authorization server for a device/user code pair. The
@@ -155,6 +157,14 @@ func startDevice(ctx context.Context, endpoint string, creds Credentials, resour
 		return nil, fmt.Errorf("starting authorization: unreadable response (status %d)", resp.StatusCode)
 	}
 	if auth.DeviceCode == "" || auth.VerificationURI == "" {
+		// The authorization server explains its own refusals (RFC 6749 §5.2);
+		// reporting only the status turns a fixable answer into a guess.
+		if auth.ErrorDescription != "" {
+			return nil, fmt.Errorf("starting authorization: %s", auth.ErrorDescription)
+		}
+		if auth.Error != "" {
+			return nil, fmt.Errorf("starting authorization: %s", auth.Error)
+		}
 		return nil, fmt.Errorf("starting authorization: server returned status %d", resp.StatusCode)
 	}
 	return &auth, nil

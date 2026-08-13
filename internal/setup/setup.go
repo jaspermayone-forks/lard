@@ -226,10 +226,13 @@ func authenticate(ctx context.Context, cfg *client.Config, opts Options) error {
 	// identically on a laptop, over SSH, in a container, and headless.
 	eps, discErr := client.Discover(ctx, cfg.URL)
 	if discErr == nil && eps.DeviceAuthorization != "" {
-		// Reuse this machine's registration when it has one; a forced login is
-		// about the grant, not the client identity.
+		// Reuse this machine's registration when it has one, so a routine
+		// re-login doesn't leave a trail of dead clients at the authorization
+		// server. A forced login starts clean instead: --force is what someone
+		// reaches for when the saved credentials are the suspect, and an
+		// identity inherited from an older lard is exactly that.
 		var creds client.Credentials
-		if cfg.OAuth != nil {
+		if cfg.OAuth != nil && !opts.Force {
 			creds = cfg.OAuth.Credentials
 		}
 		tok, creds, err := client.LoginDevice(ctx, cfg.URL, creds, client.DefaultScopes, !opts.NoBrowser)

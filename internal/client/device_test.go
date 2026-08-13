@@ -170,3 +170,24 @@ func TestRegisterRejectsMissingDeviceGrant(t *testing.T) {
 		t.Errorf("error should name the missing grant, got %v", err)
 	}
 }
+
+// An authorization server explains its refusals; passing only the status code
+// through leaves the user guessing at a question the server already answered.
+func TestStartDeviceReportsServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":             "invalid_client",
+			"error_description": "client_secret is required for pre-registered clients",
+		})
+	}))
+	defer srv.Close()
+
+	_, err := startDevice(context.Background(), srv.URL, Credentials{ClientID: "ikc_x"}, "", nil)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "client_secret is required") {
+		t.Errorf("error should carry the server's description, got %v", err)
+	}
+}
