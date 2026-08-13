@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -30,31 +29,35 @@ const (
 // LoginDevice authorizes this machine with the OAuth device authorization
 // grant (RFC 8628), talking to the authorization server directly.
 //
-// No listener, no browser, and no client secret are needed on this machine:
-// the device code itself is the proof of possession. The user approves the
-// user code at the AS's verification URI from any browser anywhere, which is
-// what makes login work unchanged over SSH, in a container, and on a headless
-// box.
-func LoginDevice(ctx context.Context, serverURL, clientID string, scopes []string, openBrowser bool) (*oauth2.Token, error) {
+// No listener and no browser are needed on this machine: the device code
+// itself is the proof of possession. The user approves the user code at the
+// AS's verification URI from any browser anywhere, which is what makes login
+// work unchanged over SSH, in a container, and on a headless box.
+//
+// A machine with no credentials registers its own (RFC 7591) first. It returns
+// them alongside the token because a refresh has to present the same client.
+func LoginDevice(ctx context.Context, serverURL string, creds Credentials, scopes []string, openBrowser bool) (*oauth2.Token, Credentials, error) {
 	eps, err := Discover(ctx, serverURL)
 	if err != nil {
-		return nil, err
+		return nil, creds, err
 	}
 	if eps.DeviceAuthorization == "" {
-		return nil, errors.New("the authorization server does not offer the device grant")
+		return nil, creds, errors.New("the authorization server does not offer the device grant")
 	}
-	if clientID == "" {
-		if reg, err := FetchRegistration(ctx, serverURL); err == nil {
-			clientID = reg.ClientID
+	if creds.ClientID == "" {
+		if eps.Registration == "" {
+			return nil, creds, errors.New("the authorization server does not offer client registration")
 		}
-	}
-	if clientID == "" {
-		return nil, errors.New("no client id: the server publishes no collector registration")
+		fresh, err := Register(ctx, eps.Registration, registrationName())
+		if err != nil {
+			return nil, creds, err
+		}
+		creds = *fresh
 	}
 
-	auth, err := startDevice(ctx, eps.DeviceAuthorization, clientID, scopes)
+	auth, err := startDevice(ctx, eps.DeviceAuthorization, creds, eps.Resource, scopes)
 	if err != nil {
-		return nil, err
+		return nil, creds, err
 	}
 	printDevicePrompt(auth, openBrowser)
 
@@ -70,19 +73,19 @@ func LoginDevice(ctx context.Context, serverURL, clientID string, scopes []strin
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, creds, ctx.Err()
 		case <-time.After(interval):
 		}
 		if time.Now().After(deadline) {
-			return nil, errors.New("this login expired; run 'lard-client login' again")
+			return nil, creds, errors.New("this login expired; run 'lard-client login' again")
 		}
-		tok, code, err := pollDevice(ctx, eps.Token, clientID, auth.DeviceCode)
+		tok, code, err := pollDevice(ctx, eps.Token, creds, auth.DeviceCode)
 		if err != nil {
-			return nil, err
+			return nil, creds, err
 		}
 		switch code {
 		case "":
-			return tok, nil
+			return tok, creds, nil
 		case errAuthorizationPending:
 			// Still waiting on the human.
 		case errSlowDown:
@@ -90,13 +93,23 @@ func LoginDevice(ctx context.Context, serverURL, clientID string, scopes []strin
 			// all subsequent requests.
 			interval += 5 * time.Second
 		case errExpiredToken:
-			return nil, errors.New("this login expired; run 'lard-client login' again")
+			return nil, creds, errors.New("this login expired; run 'lard-client login' again")
 		case errAccessDenied:
-			return nil, errors.New("authorization was declined")
+			return nil, creds, errors.New("authorization was declined")
 		default:
-			return nil, fmt.Errorf("authorization failed: %s", code)
+			return nil, creds, fmt.Errorf("authorization failed: %s", code)
 		}
 	}
+}
+
+// registrationName is what the authorization server shows on its consent
+// screen and app list, so a login from a box you forgot about is recognizable.
+func registrationName() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return "lard-client"
+	}
+	return "lard-client on " + host
 }
 
 // DeviceAuth mirrors the RFC 8628 device authorization response.
@@ -109,11 +122,16 @@ type DeviceAuth struct {
 	Interval                int    `json:"interval"`
 }
 
-// startDevice asks the authorization server for a device/user code pair.
-func startDevice(ctx context.Context, endpoint, clientID string, scopes []string) (*DeviceAuth, error) {
+// startDevice asks the authorization server for a device/user code pair. The
+// resource indicator (RFC 8707) travels with the request, so the token minted
+// at the end names lard and nothing else.
+func startDevice(ctx context.Context, endpoint string, creds Credentials, resource string, scopes []string) (*DeviceAuth, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	form := url.Values{"client_id": {clientID}}
+	form := creds.form()
+	if resource != "" {
+		form.Set("resource", resource)
+	}
 	if len(scopes) > 0 {
 		form.Set("scope", strings.Join(scopes, " "))
 	}
@@ -145,14 +163,12 @@ func startDevice(ctx context.Context, endpoint, clientID string, scopes []string
 // pollDevice asks the token endpoint once whether authorization finished. A
 // non-empty code string is an RFC 8628 status (pending, slow_down, ...)
 // rather than a transport failure.
-func pollDevice(ctx context.Context, tokenEndpoint, clientID, deviceCode string) (*oauth2.Token, string, error) {
+func pollDevice(ctx context.Context, tokenEndpoint string, creds Credentials, deviceCode string) (*oauth2.Token, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	form := url.Values{
-		"grant_type":  {deviceGrantType},
-		"device_code": {deviceCode},
-		"client_id":   {clientID},
-	}
+	form := creds.form()
+	form.Set("grant_type", deviceGrantType)
+	form.Set("device_code", deviceCode)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint,
 		strings.NewReader(form.Encode()))
 	if err != nil {

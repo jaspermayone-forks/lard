@@ -97,13 +97,10 @@ See `config.example.toml` for a ready-to-edit starting point.
 | `auth.token` | `LARD_TOKEN` | | shared secret for `token` mode |
 | `auth.auth_server` | `LARD_AUTH_SERVER` | | authorization server URL for `oauth` mode |
 | `auth.public_url` | `LARD_PUBLIC_URL` | | lard's external url; goes in the OAuth metadata |
-| `auth.allowed_client_ids` | `LARD_OAUTH_CLIENT_IDS` | | comma list of client ids allowed to call lard |
 | `auth.allowed_users` | `LARD_OAUTH_USERS` | | comma list of `me` urls allowed to call lard |
 | `auth.required_scopes` | `LARD_OAUTH_SCOPES` | | comma list of scopes every token must carry |
 | `auth.resource_name` | `LARD_RESOURCE_NAME` | `lard` | friendly name shown on the AS consent screen (RFC 9728) |
 | `auth.logo_uri` | `LARD_LOGO_URI` | (lard logo) | icon shown on the AS consent screen; `""` for none |
-| `collector.client_id` | `LARD_COLLECTOR_CLIENT_ID` | | OAuth client id collectors should use |
-| `collector.scopes` | `LARD_COLLECTOR_SCOPES` | `profile offline_access` | scopes the collector should request (`offline_access` gets a refresh token) |
 | `consolidate.after` | `LARD_CONSOLIDATE_AFTER` | `5m` | quiet period before a pass; `off` to disable |
 | `consolidate.max_wait` | `LARD_CONSOLIDATE_MAX_WAIT` | `30m` | cap on that wait during constant uploads |
 
@@ -213,19 +210,37 @@ when today might still be wanted.
   proxy because clients check that the issuer matches where they fetched the
   document
 
+every token must name lard in its audience ([rfc 8707]). that one check is the
+whole authorization model: a token minted for some other app the user
+authorized names that app, so it bounces here, and there is no client
+allowlist to keep in sync. clients ask for the audience by sending
+`resource=<lard's url>`, which they read out of the protected-resource
+document.
+
+clients that need an identity register their own ([rfc 7591]) at the
+authorization server. lard hands out nothing and knows none of them by name.
+`lard-client` registers as a public client: the device code is its own proof of
+possession, so a login is one command on a fresh box with nothing to copy over.
+
 ### login (device grant)
 
-the only login flow is the OAuth device authorization grant ([rfc 8628]):
+`lard-client` registers itself once, then runs the OAuth device authorization
+grant ([rfc 8628]):
 
 ```
+POST {as}/oauth/register           this machine claims its own client identity
 POST {as}/auth/device              client gets a device code + user code + url
 GET  {as}/device?code=XXXX-XXXX    user approves, from any browser anywhere
 POST {as}/auth/token               client polls until the token appears
 ```
 
-requirements on the provider: it must serve rfc 8414 metadata advertising `device_authorization_endpoint` and support the device grant.
+requirements on the provider: rfc 8414 metadata advertising
+`device_authorization_endpoint` and `registration_endpoint`, the device grant,
+and rfc 8707 resource indicators echoed as `aud` on introspection.
 
 [rfc 8628]: https://datatracker.ietf.org/doc/html/rfc8628
+[rfc 8707]: https://datatracker.ietf.org/doc/html/rfc8707
+[rfc 7591]: https://datatracker.ietf.org/doc/html/rfc7591
 [rfc 7662]: https://datatracker.ietf.org/doc/html/rfc7662
 [rfc 8414]: https://datatracker.ietf.org/doc/html/rfc8414
 

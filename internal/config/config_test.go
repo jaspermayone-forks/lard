@@ -25,13 +25,8 @@ api_key = "sk-test123"
 mode = "oauth"
 auth_server = "https://auth.example.com"
 public_url = "https://lard.example.com"
-allowed_client_ids = ["client1", "client2"]
 allowed_users = ["user@example.com"]
 required_scopes = ["profile", "email"]
-
-[collector]
-client_id = "collector-abc"
-scopes = ["read", "write"]
 
 [consolidate]
 after = "10m"
@@ -58,8 +53,8 @@ max_wait = "1h"
 	if cfg.Auth.Mode != "oauth" {
 		t.Errorf("expected mode oauth, got %s", cfg.Auth.Mode)
 	}
-	if len(cfg.Auth.AllowedClientIDs) != 2 {
-		t.Errorf("expected 2 allowed client IDs, got %d", len(cfg.Auth.AllowedClientIDs))
+	if len(cfg.Auth.AllowedUsers) != 1 {
+		t.Errorf("expected 1 allowed user, got %d", len(cfg.Auth.AllowedUsers))
 	}
 	if cfg.Consolidate.After != "10m" {
 		t.Errorf("expected consolidate after 10m, got %s", cfg.Consolidate.After)
@@ -135,8 +130,7 @@ func clearLARDEnv() {
 		"LARD_ADDR", "LARD_DB", "LARD_MEMORY_DIR",
 		"LARD_HYPER_BASE_URL", "LARD_MODEL", "LARD_HYPER_API_KEY", "OPENAI_API_VERSION",
 		"LARD_AUTH", "LARD_TOKEN", "LARD_AUTH_SERVER", "LARD_PUBLIC_URL",
-		"LARD_OAUTH_CLIENT_IDS", "LARD_OAUTH_USERS", "LARD_OAUTH_SCOPES",
-		"LARD_COLLECTOR_CLIENT_ID", "LARD_COLLECTOR_SCOPES",
+		"LARD_OAUTH_USERS", "LARD_OAUTH_SCOPES",
 		"LARD_CONSOLIDATE_AFTER", "LARD_CONSOLIDATE_MAX_WAIT",
 	}
 	for _, v := range envVars {

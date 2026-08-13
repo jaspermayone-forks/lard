@@ -28,7 +28,6 @@ type Server struct {
 
 	LLM         LLM         `toml:"llm"`
 	Auth        Auth        `toml:"auth"`
-	Collector   Collector   `toml:"collector"`
 	Consolidate Consolidate `toml:"consolidate"`
 }
 
@@ -43,22 +42,15 @@ type LLM struct {
 
 // Auth holds authentication configuration.
 type Auth struct {
-	Mode             string   `toml:"mode" env:"LARD_AUTH" default:"none"`
-	Token            string   `toml:"token" env:"LARD_TOKEN"`
-	AuthServerURL    string   `toml:"auth_server" env:"LARD_AUTH_SERVER"`
-	PublicURL        string   `toml:"public_url" env:"LARD_PUBLIC_URL"`
-	AllowedClientIDs []string `toml:"allowed_client_ids" env:"LARD_OAUTH_CLIENT_IDS"`
-	AllowedUsers     []string `toml:"allowed_users" env:"LARD_OAUTH_USERS"`
-	RequiredScopes   []string `toml:"required_scopes" env:"LARD_OAUTH_SCOPES"`
+	Mode           string   `toml:"mode" env:"LARD_AUTH" default:"none"`
+	Token          string   `toml:"token" env:"LARD_TOKEN"`
+	AuthServerURL  string   `toml:"auth_server" env:"LARD_AUTH_SERVER"`
+	PublicURL      string   `toml:"public_url" env:"LARD_PUBLIC_URL"`
+	AllowedUsers   []string `toml:"allowed_users" env:"LARD_OAUTH_USERS"`
+	RequiredScopes []string `toml:"required_scopes" env:"LARD_OAUTH_SCOPES"`
 	// Shown on the authorization server's consent screen (RFC 9728 metadata).
 	ResourceName string `toml:"resource_name" env:"LARD_RESOURCE_NAME" default:"lard"`
 	LogoURI      string `toml:"logo_uri" env:"LARD_LOGO_URI" default:"https://l4.dunkirk.sh/i/qSu61P7PQtbT.webp"`
-}
-
-// Collector holds the collector OAuth registration.
-type Collector struct {
-	ClientID string   `toml:"client_id" env:"LARD_COLLECTOR_CLIENT_ID"`
-	Scopes   []string `toml:"scopes" env:"LARD_COLLECTOR_SCOPES"`
 }
 
 // Consolidate holds auto-consolidation settings.

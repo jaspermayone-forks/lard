@@ -62,6 +62,7 @@ func TestOAuthAcceptsActiveToken(t *testing.T) {
 	srv := fakeAuthServer(t, map[string]any{
 		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "https://app.example.com", "scope": "profile email",
+		"aud": "https://lard.example.com",
 	})
 	h := Middleware(oauthConfig(srv.URL), okHandler())
 	w := do(h, "Bearer good")
@@ -97,31 +98,16 @@ func TestOAuthRejectsMissingHeader(t *testing.T) {
 
 // A token minted for a different app must not open lard. This is the confused
 // deputy case: the provider happily issues tokens for every app the user
-// authorizes.
+// authorizes, and only the audience distinguishes them.
 func TestOAuthRejectsForeignClient(t *testing.T) {
 	srv := fakeAuthServer(t, map[string]any{
 		"active": true, "me": "https://auth.example.com/u/kieran",
 		"client_id": "https://someone-elses-app.example.com", "scope": "profile",
+		"aud": "https://someone-elses-app.example.com",
 	})
-	cfg := oauthConfig(srv.URL)
-	cfg.AllowedClientIDs = []string{"https://lard.example.com/"}
-	h := Middleware(cfg, okHandler())
-	w := do(h, "Bearer good")
+	w := do(Middleware(oauthConfig(srv.URL), okHandler()), "Bearer good")
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("want 403 for foreign client, got %d", w.Code)
-	}
-}
-
-func TestOAuthAllowsListedClientIgnoringTrailingSlash(t *testing.T) {
-	srv := fakeAuthServer(t, map[string]any{
-		"active": true, "me": "https://auth.example.com/u/kieran",
-		"client_id": "https://lard.example.com", "scope": "profile",
-	})
-	cfg := oauthConfig(srv.URL)
-	cfg.AllowedClientIDs = []string{"https://lard.example.com/"}
-	h := Middleware(cfg, okHandler())
-	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", w.Code)
 	}
 }
 
@@ -158,21 +144,23 @@ func TestOAuthAcceptsAudienceArrayContainingResource(t *testing.T) {
 	}
 }
 
-func TestOAuthAcceptsUnscopedToken(t *testing.T) {
-	// A token with no aud (unscoped) still passes — falls back to allowlists.
+func TestOAuthRejectsUnscopedToken(t *testing.T) {
+	// A token with no aud names no resource, so it is no better than a
+	// stranger's: it could have been minted for anything.
 	srv := fakeAuthServer(t, map[string]any{
 		"active": true, "me": "https://auth.example.com/u/kieran",
 	})
 	h := Middleware(oauthConfig(srv.URL), okHandler())
-	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
-		t.Fatalf("want 200 for an unscoped token, got %d", w.Code)
+	if w := do(h, "Bearer good"); w.Code != http.StatusForbidden {
+		t.Fatalf("want 403 for a token with no audience, got %d", w.Code)
 	}
 }
 
 func TestOAuthRejectsUnlistedUser(t *testing.T) {
 	srv := fakeAuthServer(t, map[string]any{
 		"active": true, "me": "https://auth.example.com/u/stranger",
-		"client_id": "https://lard.example.com", "scope": "profile",
+		"client_id": "https://app.example.com", "scope": "profile",
+		"aud": "https://lard.example.com",
 	})
 	cfg := oauthConfig(srv.URL)
 	cfg.AllowedUsers = []string{"https://auth.example.com/u/kieran"}
@@ -185,7 +173,8 @@ func TestOAuthRejectsUnlistedUser(t *testing.T) {
 func TestOAuthRejectsInsufficientScope(t *testing.T) {
 	srv := fakeAuthServer(t, map[string]any{
 		"active": true, "me": "https://auth.example.com/u/kieran",
-		"client_id": "https://lard.example.com", "scope": "profile",
+		"client_id": "https://app.example.com", "scope": "profile",
+		"aud": "https://lard.example.com",
 	})
 	cfg := oauthConfig(srv.URL)
 	cfg.RequiredScopes = []string{"email"}
@@ -313,12 +302,12 @@ func TestOAuthFailsClosedWhenProviderUnreachable(t *testing.T) {
 	}
 }
 
-func TestValidateWarnsAboutMissingAudience(t *testing.T) {
-	warns := Config{Mode: ModeOAuth, AuthServerURL: "https://i", PublicURL: "https://l"}.Validate()
-	if len(warns) != 1 || !strings.Contains(warns[0], "audience") {
-		t.Fatalf("want audience warning, got %v", warns)
+func TestValidateWarnsAboutMissingAuthServer(t *testing.T) {
+	warns := Config{Mode: ModeOAuth, PublicURL: "https://l"}.Validate()
+	if len(warns) != 1 || !strings.Contains(warns[0], "authorization server") {
+		t.Fatalf("want an authorization server warning, got %v", warns)
 	}
-	cfg := Config{Mode: ModeOAuth, AuthServerURL: "https://i", PublicURL: "https://l", AllowedUsers: []string{"me"}}
+	cfg := Config{Mode: ModeOAuth, AuthServerURL: "https://i", PublicURL: "https://l"}
 	if warns := cfg.Validate(); len(warns) != 0 {
 		t.Fatalf("want no warnings, got %v", warns)
 	}
@@ -328,71 +317,6 @@ func TestHealthzBypassesAuth(t *testing.T) {
 	h := Middleware(Config{Mode: ModeToken, Token: "s3cret"}, okHandler())
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", w.Code)
-	}
-}
-
-// The client id a server publishes to collectors must be accepted without the
-// operator also repeating it in the allowlist. Publishing an identity and then
-// rejecting it is the failure this guards.
-func TestCollectorClientIDIsTrustedImplicitly(t *testing.T) {
-	srv := fakeAuthServer(t, map[string]any{
-		"active": true, "me": "https://auth.example.com/u/kieran",
-		"client_id": "ikc_collector", "scope": "profile",
-	})
-	cfg := oauthConfig(srv.URL)
-	cfg.CollectorClientID = "ikc_collector"
-	h := Middleware(cfg, okHandler())
-	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
-		t.Fatalf("want 200 for the published collector id, got %d", w.Code)
-	}
-}
-
-// An explicit collector id is itself a restriction, so it must not widen access
-// to every client the user has ever authorized.
-func TestCollectorClientIDNarrowsWhenNoOtherAllowlist(t *testing.T) {
-	srv := fakeAuthServer(t, map[string]any{
-		"active": true, "me": "https://auth.example.com/u/kieran",
-		"client_id": "https://some-other-app.example.com/", "scope": "profile",
-	})
-	cfg := oauthConfig(srv.URL)
-	cfg.CollectorClientID = "ikc_collector"
-	h := Middleware(cfg, okHandler())
-	if w := do(h, "Bearer good"); w.Code != http.StatusForbidden {
-		t.Fatalf("want 403 for a foreign client, got %d", w.Code)
-	}
-}
-
-func TestCollectorClientIDAddsToExistingAllowlist(t *testing.T) {
-	srv := fakeAuthServer(t, map[string]any{
-		"active": true, "me": "https://auth.example.com/u/kieran",
-		"client_id": "ikc_mcp", "scope": "profile",
-	})
-	cfg := oauthConfig(srv.URL)
-	cfg.AllowedClientIDs = []string{"ikc_mcp"}
-	cfg.CollectorClientID = "ikc_collector"
-	h := Middleware(cfg, okHandler())
-	if w := do(h, "Bearer good"); w.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", w.Code)
-	}
-}
-
-// Setting only a collector id counts as an audience restriction, so the
-// "anyone can read your memory" warning must not fire.
-func TestValidateAcceptsCollectorIDAsAudience(t *testing.T) {
-	cfg := Config{Mode: ModeOAuth, AuthServerURL: "https://i", PublicURL: "https://l", CollectorClientID: "ikc_x"}
-	if warns := cfg.Validate(); len(warns) != 0 {
-		t.Fatalf("want no warnings, got %v", warns)
-	}
-}
-
-// The collector registration must be reachable without credentials, since it
-// is how a collector learns which client to be.
-func TestCollectorPathBypassesAuth(t *testing.T) {
-	h := Middleware(Config{Mode: ModeToken, Token: "s3cret"}, okHandler())
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, PathCollector, nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", w.Code)
 	}

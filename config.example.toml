@@ -28,20 +28,15 @@ api_version = ""
 mode = "none"          # none, token, or oauth
 token = ""             # shared secret for token mode
 auth_server = ""       # authorization server URL for oauth mode
-public_url = ""        # lard's external URL; goes in the OAuth metadata
-allowed_client_ids = []  # OAuth client IDs allowed to access
-allowed_users = []       # user identity URLs allowed to access
-required_scopes = []     # scopes every token must carry
+public_url = ""        # lard's external URL. It goes in the OAuth metadata and
+                       # is the audience every token must name (RFC 8707), so
+                       # clients register themselves and no client allowlist is
+                       # needed here.
+allowed_users = []     # user identity URLs allowed to access
+required_scopes = []   # scopes every token must carry
 # Shown on the authorization server's consent screen (RFC 9728 metadata).
 resource_name = "lard"                                    # friendly name
 logo_uri = "https://l4.dunkirk.sh/i/qSu61P7PQtbT.webp"    # icon (or "" for none)
-
-# Collector registration (published to edge collectors)
-[collector]
-client_id = ""                              # the OAuth client ID collectors should use
-scopes = ["profile", "offline_access"]      # scopes the collector should request
-                                            # (offline_access -> refresh token, so the
-                                            # collector survives past the 1h access token)
 
 # Auto-consolidation (runs when uploads go quiet)
 [consolidate]

@@ -56,7 +56,7 @@ func TestSaveConfigTOML(t *testing.T) {
 		OAuth: &OAuthToken{
 			AccessToken:  "access-token",
 			RefreshToken: "refresh-token",
-			ClientID:     "client-id",
+			Credentials:  Credentials{ClientID: "client-id", ClientSecret: "client-secret"},
 		},
 	}
 
@@ -77,5 +77,10 @@ func TestSaveConfigTOML(t *testing.T) {
 	}
 	if loadedCfg.Token != cfg.Token {
 		t.Errorf("expected token %s, got %s", cfg.Token, loadedCfg.Token)
+	}
+	// The client identity has to survive the round trip, or a refresh after a
+	// restart has nothing to authenticate with.
+	if loadedCfg.OAuth == nil || loadedCfg.OAuth.Credentials != cfg.OAuth.Credentials {
+		t.Errorf("expected credentials %+v, got %+v", cfg.OAuth.Credentials, loadedCfg.OAuth)
 	}
 }

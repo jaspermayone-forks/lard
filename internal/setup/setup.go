@@ -226,11 +226,13 @@ func authenticate(ctx context.Context, cfg *client.Config, opts Options) error {
 	// identically on a laptop, over SSH, in a container, and headless.
 	eps, discErr := client.Discover(ctx, cfg.URL)
 	if discErr == nil && eps.DeviceAuthorization != "" {
-		reg, regErr := client.FetchRegistration(ctx, cfg.URL)
-		if regErr != nil {
-			return fmt.Errorf("server publishes no collector registration; set LARD_COLLECTOR_CLIENT_ID there")
+		// Reuse this machine's registration when it has one; a forced login is
+		// about the grant, not the client identity.
+		var creds client.Credentials
+		if cfg.OAuth != nil {
+			creds = cfg.OAuth.Credentials
 		}
-		tok, err := client.LoginDevice(ctx, cfg.URL, reg.ClientID, reg.Scopes, !opts.NoBrowser)
+		tok, creds, err := client.LoginDevice(ctx, cfg.URL, creds, client.DefaultScopes, !opts.NoBrowser)
 		if err != nil {
 			return err
 		}
@@ -238,7 +240,7 @@ func authenticate(ctx context.Context, cfg *client.Config, opts Options) error {
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
 			Expiry:       tok.Expiry,
-			ClientID:     reg.ClientID,
+			Credentials:  creds,
 		}
 		cfg.Token = ""
 		return nil

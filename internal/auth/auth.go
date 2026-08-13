@@ -10,8 +10,11 @@
 // The authorization server issues tokens for every app the user authorizes,
 // so lard must check that a token was actually minted for lard. Without that
 // check any app the user has ever signed into could read their whole memory
-// (the "confused deputy" problem). Set an audience or user allowlist to
-// close it.
+// (the "confused deputy" problem). The check is the token's audience (RFC
+// 8707): a client names lard as the resource when it asks for the token, the
+// authorization server binds it, and lard requires it. No allowlist to keep,
+// and clients register themselves (RFC 7591) instead of adopting an identity
+// lard hands out.
 package auth
 
 import (
@@ -45,9 +48,6 @@ const (
 const (
 	PathProtectedResource = "/.well-known/oauth-protected-resource"
 	PathAuthServer        = "/.well-known/oauth-authorization-server"
-	// PathCollector is the unauthenticated prefix serving the collector OAuth
-	// registration and, for confidential clients, the code exchange.
-	PathCollector = "/auth/collector"
 )
 
 // Config holds auth settings.
@@ -61,20 +61,11 @@ type Config struct {
 	// resource identifier in the protected-resource metadata, so clients know
 	// which resource they are asking the authorization server for a token for.
 	PublicURL string
-	// AllowedClientIDs limits which OAuth clients may call lard, matched
-	// against the client_id on the introspected token. Empty means any client
-	// the user has authorized is accepted.
-	AllowedClientIDs []string
 	// AllowedUsers limits which identities may call lard, matched against
 	// the token's "me" URL. Empty means any user is accepted.
 	AllowedUsers []string
 	// RequiredScopes are scopes every token must carry. Empty means none.
 	RequiredScopes []string
-	// CollectorClientID is the OAuth client this server tells collectors to
-	// use. It is trusted implicitly: publishing an identity and then rejecting
-	// it would be a contradiction, and forcing the operator to repeat it in
-	// AllowedClientIDs is a step that only ever gets forgotten.
-	CollectorClientID string
 	// ResourceName and LogoURI are published in the protected-resource metadata
 	// so an authorization server can show a friendly name + icon on its consent
 	// screen. Empty ResourceName omits the field (clients fall back to the host).
@@ -82,22 +73,7 @@ type Config struct {
 	LogoURI      string
 }
 
-// clientAllowlist is the set of client ids accepted, including the collector
-// registration this server hands out.
-func (c Config) clientAllowlist() []string {
-	if c.CollectorClientID == "" {
-		return c.AllowedClientIDs
-	}
-	if len(c.AllowedClientIDs) == 0 {
-		// An explicit collector id is itself a restriction, so honor it as the
-		// whole allowlist rather than treating "no list" as "allow anything".
-		return []string{c.CollectorClientID}
-	}
-	return append(append([]string{}, c.AllowedClientIDs...), c.CollectorClientID)
-}
-
-// Validate reports configuration problems worth logging at boot. OAuth mode
-// with no allowlist works, but it trusts every app the user has authorized.
+// Validate reports configuration problems worth logging at boot.
 func (c Config) Validate() []string {
 	var warns []string
 	if c.Mode != ModeOAuth {
@@ -107,10 +83,7 @@ func (c Config) Validate() []string {
 		warns = append(warns, "oauth auth has no authorization server URL; every request will be rejected")
 	}
 	if c.PublicURL == "" {
-		warns = append(warns, "oauth auth has no public_url; OAuth discovery metadata will be incomplete")
-	}
-	if len(c.clientAllowlist()) == 0 && len(c.AllowedUsers) == 0 {
-		warns = append(warns, "oauth auth has no audience restriction: any app the user authorized with the same provider can read all memory (set allowed_client_ids or allowed_users)")
+		warns = append(warns, "oauth auth has no public_url; tokens are matched against the audience derived from each request's host headers")
 	}
 	return warns
 }
@@ -144,9 +117,9 @@ func Middleware(cfg Config, next http.Handler) http.Handler {
 	v := &verifier{cfg: cfg, cache: map[string]cacheEntry{}}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		// Discovery and the collector registration must be reachable without
-		// credentials: they are how a caller learns to get credentials.
-		if p == "/healthz" || strings.HasPrefix(p, "/.well-known/") || strings.HasPrefix(p, PathCollector) {
+		// Discovery must be reachable without credentials: it is how a caller
+		// learns to get credentials.
+		if p == "/healthz" || strings.HasPrefix(p, "/.well-known/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -305,23 +278,20 @@ func (v *verifier) authorize(r *http.Request) (id Identity, status int, code, de
 		return id, http.StatusUnauthorized, "invalid_token", "token is not active"
 	}
 	scopes := strings.Fields(res.Scope)
-	// RFC 8707: a token that names an audience must name THIS resource — the
-	// core defence against a confused deputy (a token minted for some other
-	// service the user authorized being replayed here). Unscoped tokens (no aud)
-	// fall through to the client/user allowlists, so older tokens keep working.
-	if len(res.Audience) > 0 && !res.Audience.has(NormalizeSubject(v.cfg.resourceID(r))) {
+	// RFC 8707: the token must name THIS resource. That single check is what
+	// keeps lard from being a confused deputy — a token minted for some other
+	// service the user authorized, replayed here, names the other service. A
+	// token with no audience at all names nothing, so it is no better than a
+	// stranger's, and is refused too.
+	want := NormalizeSubject(v.cfg.resourceID(r))
+	if !res.Audience.has(want) {
 		slog.Warn("auth: token audience mismatch",
-			"token_aud", []string(res.Audience), "want", v.cfg.resourceID(r))
+			"token_aud", []string(res.Audience), "want", want, "token_client_id", res.ClientID)
 		return id, http.StatusForbidden, "invalid_token", "token was not issued for this resource"
 	}
 	// Denials are logged with the claims that failed. A 403 here is almost
 	// always an allowlist typo, and the operator cannot see the token's real
-	// client_id or "me" value any other way.
-	if !allowed(v.cfg.clientAllowlist(), res.ClientID) {
-		slog.Warn("auth: client not allowed",
-			"token_client_id", res.ClientID, "allowed", v.cfg.clientAllowlist())
-		return id, http.StatusForbidden, "invalid_token", "token was not issued for this resource"
-	}
+	// "me" value any other way.
 	if !allowed(v.cfg.AllowedUsers, res.subject()) {
 		slog.Warn("auth: user not allowed",
 			"token_user", res.subject(), "allowed", v.cfg.AllowedUsers)

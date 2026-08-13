@@ -37,9 +37,10 @@ type OAuthToken struct {
 	AccessToken  string    `json:"accessToken"`
 	RefreshToken string    `json:"refreshToken,omitempty"`
 	Expiry       time.Time `json:"expiry,omitempty"`
-	// ClientID is the public OAuth client this token was minted for. A refresh
-	// must present the same id, so it is pinned here rather than re-derived.
-	ClientID string `json:"clientId,omitempty"`
+	// Credentials is the OAuth client this machine registered as. A refresh
+	// must present the same client, so they are pinned here rather than
+	// re-derived.
+	Credentials
 }
 
 // expired reports whether the access token is gone or about to lapse. The
@@ -128,7 +129,7 @@ func (c *Config) Verify(ctx context.Context) (string, error) {
 		}
 		return "", errors.New("server rejected the token (401); check LARD_TOKEN matches the server's")
 	case resp.StatusCode == http.StatusForbidden:
-		return "", errors.New("token is valid but not allowed for this server (403); check the server's allowlist")
+		return "", errors.New("token is valid but not for this server (403); re-run 'lard-client login -f' to get one bound to it")
 	case resp.StatusCode == http.StatusNotFound:
 		// An older server without /whoami. Reaching it at all is enough.
 		return "", nil
@@ -158,7 +159,7 @@ func (c *Config) BearerToken(ctx context.Context, path string) (string, error) {
 		if !c.OAuth.expired() {
 			return c.OAuth.AccessToken, nil
 		}
-		tok, err := RefreshToken(ctx, c.URL, c.OAuth.RefreshToken, c.OAuth.ClientID)
+		tok, err := RefreshToken(ctx, c.URL, c.OAuth.RefreshToken, c.OAuth.Credentials)
 		if err != nil {
 			return "", err
 		}

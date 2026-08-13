@@ -15,7 +15,6 @@ import (
 
 	"github.com/taciturnaxolotl/lard/internal/auth"
 	"github.com/taciturnaxolotl/lard/internal/backup"
-	"github.com/taciturnaxolotl/lard/internal/collector"
 	"github.com/taciturnaxolotl/lard/internal/config"
 	"github.com/taciturnaxolotl/lard/internal/dotenv"
 	"github.com/taciturnaxolotl/lard/internal/httpapi"
@@ -243,29 +242,16 @@ func run() error {
 	}
 
 	authCfg := auth.Config{
-		Mode:              auth.Mode(cfg.Auth.Mode),
-		Token:             cfg.Auth.Token,
-		AuthServerURL:     cfg.Auth.AuthServerURL,
-		PublicURL:         cfg.Auth.PublicURL,
-		AllowedClientIDs:  cfg.Auth.AllowedClientIDs,
-		AllowedUsers:      cfg.Auth.AllowedUsers,
-		RequiredScopes:    cfg.Auth.RequiredScopes,
-		CollectorClientID: cfg.Collector.ClientID,
-		ResourceName:      cfg.Auth.ResourceName,
-		LogoURI:           cfg.Auth.LogoURI,
+		Mode:           auth.Mode(cfg.Auth.Mode),
+		Token:          cfg.Auth.Token,
+		AuthServerURL:  cfg.Auth.AuthServerURL,
+		PublicURL:      cfg.Auth.PublicURL,
+		AllowedUsers:   cfg.Auth.AllowedUsers,
+		RequiredScopes: cfg.Auth.RequiredScopes,
+		ResourceName:   cfg.Auth.ResourceName,
+		LogoURI:        cfg.Auth.LogoURI,
 	}
 
-	// The collector registration: which OAuth client edge collectors adopt.
-	// Login itself is the device grant against the authorization server, so
-	// this server only publishes the identity.
-	collectorCfg := collector.Config{
-		ClientID: cfg.Collector.ClientID,
-		Scopes:   cfg.Collector.Scopes,
-	}
-	collectorH := collector.New(collectorCfg)
-	if collectorCfg.Configured() {
-		slog.Info("collector registration published", "client_id", collectorCfg.ClientID)
-	}
 	for _, warn := range authCfg.Validate() {
 		slog.Warn("auth: " + warn)
 	}
@@ -278,7 +264,6 @@ func run() error {
 	mux.Handle(auth.PathProtectedResource, auth.ProtectedResourceMetadata(authCfg))
 	mux.Handle(auth.PathProtectedResource+"/", auth.ProtectedResourceMetadata(authCfg))
 	mux.Handle(auth.PathAuthServer, auth.AuthServerMetadata(authCfg))
-	mux.HandleFunc("GET "+auth.PathCollector, collectorH.Register)
 	mux.Handle("/", api.Handler())
 
 	srv := &http.Server{
